@@ -18,15 +18,13 @@ def paste_text(text):
 
 def open_notepad_and_paste(text):
     subprocess.Popen(['notepad.exe'])
-    time.sleep(1.5)
+    time.sleep(1.5) 
     paste_text(text)
-
 
 def listen_and_paste():
     recognizer = sr.Recognizer()
-    pyautogui.alert(text='Agent Active! Speak now...', title='Voice Agent', button='OK')
     with sr.Microphone() as source:
-        print("sListening...")
+        print("Listening...")
         audio = recognizer.listen(source)
     try:
         text = recognizer.recognize_google(audio)
@@ -55,4 +53,7 @@ def start_hotkey_listener():
         listener.join()
 
 if __name__ == "__main__":
-    start_hotkey_listener()
+    pyautogui.alert(text='Agent Active! Always listening...', title='Voice Agent', button='OK')
+    print("Agent started. Always listening for voice input...")
+    while True:
+        listen_and_paste()

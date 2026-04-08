@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pynput
+SpeechRecognition
+pyttsx3
+pyperclip
+pyautogui
+pyaudio

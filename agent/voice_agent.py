@@ -1,10 +1,3 @@
-"""
-╔══════════════════════════════════════════════════════════╗
-║          ProVoiceAgent — Professional Desktop AI Agent   ║
-║          Powered by Groq LLaMA + Voice Recognition       ║
-╚══════════════════════════════════════════════════════════╝
-"""
-
 import os
 import sys
 import json

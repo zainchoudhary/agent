@@ -1,5 +1,4 @@
-# Add your Groq API key here
-GROQ_API_KEY = "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"
+## Do not put secrets here! Use .env file for GROQ_API_KEY
 AGENT_CONFIG = {
     # Groq model — llama-3.3-70b-versatile is best free option
     "model":           "llama-3.3-70b-versatile",

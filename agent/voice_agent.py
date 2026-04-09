@@ -20,7 +20,13 @@ import speech_recognition as sr
 import pyttsx3
 import psutil
 
-from .config import GROQ_API_KEY, AGENT_CONFIG
+from .config import AGENT_CONFIG
+
+# Load .env and get GROQ_API_KEY
+from dotenv import load_dotenv
+load_dotenv()  # Load .env file for secrets (GROQ_API_KEY)
+load_dotenv(dotenv_path=Path(__file__).parent.parent / '.env')
+GROQ_API_KEY = os.getenv('GROQ_API_KEY')
 
 # ══════════════════════════════════════════════════════════
 # LOGGING

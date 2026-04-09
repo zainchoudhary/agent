@@ -19,6 +19,7 @@ import requests
 import speech_recognition as sr
 import pyttsx3
 import psutil
+import winreg
 
 from .config import AGENT_CONFIG
 
@@ -36,9 +37,9 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s │ %(levelname)-8s │ %(message)s",
+    format="%(asctime)s | %(levelname)-8s | %(message)s",  # ASCII pipe to avoid UnicodeEncodeError
     handlers=[
-        logging.FileHandler(LOG_DIR / f"agent_{datetime.now().strftime('%Y%m%d')}.log"),
+        logging.FileHandler(LOG_DIR / f"agent_{datetime.now().strftime('%Y%m%d')}.log", encoding="utf-8"),
         logging.StreamHandler(sys.stdout),
     ],
 )
@@ -178,6 +179,67 @@ class ActionExecutor:
         "event viewer":  ["eventvwr"],
     }
 
+    # ── App name aliases (normalize common variations) ────
+    APP_ALIASES: Dict[str, str] = {
+        "file explorer": "explorer",
+        "file_explorer": "explorer",
+        "windows explorer": "explorer",
+        "explorer app": "explorer",
+        "file manager": "explorer",
+        "task mgr": "task manager",
+        "tasks": "task manager",
+        "taskmgr": "task manager",
+        "visual studio code": "vscode",
+        "vs code": "vscode",
+        "vscode": "vscode",
+        "code editor": "vscode",
+        "notepad app": "notepad",
+        "notes": "notepad",
+        "text editor": "notepad",
+        "calc": "calculator",
+        "calc app": "calculator",
+        "calculator app": "calculator",
+        "paint app": "paint",
+        "paint tool": "paint",
+        "cmd prompt": "cmd",
+        "command prompt": "cmd",
+        "powershell app": "powershell",
+        "ps": "powershell",
+        "settings app": "settings",
+        "system settings": "settings",
+        "windows settings": "settings",
+        "chrome browser": "chrome",
+        "google chrome": "chrome",
+        "firefox browser": "firefox",
+        "mozilla firefox": "firefox",
+        "edge browser": "edge",
+        "microsoft edge": "edge",
+        "telegram app": "telegram",
+        "teams app": "teams",
+        "microsoft teams": "teams",
+        "slack app": "slack",
+        "discord app": "discord",
+        "spotify app": "spotify",
+        "zoom meeting": "zoom",
+        "onenote app": "onenote",
+        "outlook email": "outlook",
+        "microsoft outlook": "outlook",
+        "word doc": "word",
+        "microsoft word": "word",
+        "excel sheet": "excel",
+        "microsoft excel": "excel",
+        "powerpoint ppt": "powerpoint",
+        "microsoft powerpoint": "powerpoint",
+        "vlc media": "vlc",
+        "vlc player": "vlc",
+        "snip": "snipping tool",
+        "screenshot tool": "snipping tool",
+        "control panel app": "control panel",
+        "settings": "settings",
+        "camera app": "camera",
+        "webcam": "camera",
+    }
+
     # ── Search engine table ───────────────────────────────
     SEARCH_ENGINES: Dict[str, str] = {
         "google":       "https://www.google.com/search?q={}",
@@ -200,6 +262,9 @@ class ActionExecutor:
         self._handlers = {
             "open_app":         self._open_app,
             "close_app":        self._close_app,
+            "restart_app":      self._restart_app,
+            "list_apps":        self._list_apps,
+            "app_status":       self._app_status,
             "search_web":       self._search_web,
             "open_url":         self._open_url,
             "type_text":        self._type_text,
@@ -238,10 +303,169 @@ class ActionExecutor:
             log.error(f"Action error [{act}]: {e}", exc_info=True)
             return ActionResult(False, f"Error in {act}: {e}")
 
+    # ── INTELLIGENT APP NAME MATCHING ──────────────────────
+    def _normalize_and_match_app(self, app_input: str) -> str:
+        """Intelligently match app name using aliases and fuzzy matching."""
+        if not app_input:
+            return app_input
+        
+        app = app_input.lower().strip()
+        
+        # Step 1: Direct alias match
+        if app in self.APP_ALIASES:
+            matched = self.APP_ALIASES[app]
+            log.info(f"App alias match: '{app_input}' → '{matched}'")
+            return matched
+        
+        # Step 2: Fuzzy match against known apps
+        from difflib import SequenceMatcher
+        all_known_apps = list(self.APP_MAP.keys()) + list(self.APP_ALIASES.keys())
+        best_match = None
+        best_ratio = 0.6  # Threshold for fuzzy match
+        
+        for known_app in all_known_apps:
+            ratio = SequenceMatcher(None, app, known_app).ratio()
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_match = known_app
+        
+        if best_match:
+            final = self.APP_ALIASES.get(best_match, best_match)
+            log.info(f"App fuzzy match: '{app_input}' → '{final}' (confidence: {best_ratio:.0%})")
+            return final
+        
+        # Step 3: Try to match just the main word
+        words = app.split()
+        if len(words) > 1:
+            # If name has multiple words, try matching the longest/most descriptive word
+            for word in sorted(words, key=len, reverse=True):
+                if word in self.APP_ALIASES:
+                    matched = self.APP_ALIASES[word]
+                    log.info(f"App word match: '{app_input}' → '{matched}'")
+                    return matched
+        
+        # Step 4: Return normalized version
+        return app
+
+    # ── INTELLIGENT PROCESS MANAGEMENT ──────────────────────
+    def _find_processes_by_name(self, app: str) -> List[int]:
+        """Find all process IDs matching the app name using intelligent matching."""
+        from difflib import SequenceMatcher
+        
+        pids = []
+        app_clean = app.replace(" ", "").replace(".exe", "").lower()
+        
+        try:
+            for p in psutil.process_iter(['pid', 'name', 'cmdline']):
+                try:
+                    name = p.info['name']
+                    name_lower = name.lower()
+                    name_clean = name_lower.replace(" ", "").replace(".exe", "")
+                    
+                    # Direct matches
+                    if app == name_lower or app_clean == name_clean:
+                        pids.append(p.info['pid'])
+                        continue
+                    
+                    # Substring matches
+                    if app in name_lower or name_clean in app_clean:
+                        pids.append(p.info['pid'])
+                        continue
+                    
+                    # Fuzzy match for typos/variations
+                    ratio = SequenceMatcher(None, app_clean, name_clean).ratio()
+                    if ratio > 0.7:  # 70% match threshold
+                        pids.append(p.info['pid'])
+                        log.info(f"Fuzzy matched process: {name} ({ratio:.0%})")
+                        continue
+                    
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+        except Exception as e:
+            log.error(f"Error scanning processes: {e}")
+        
+        return pids
+
+    def _kill_process_by_pid(self, pid: int, force: bool = True) -> bool:
+        """Kill a process by PID safely."""
+        try:
+            p = psutil.Process(pid)
+            if force:
+                p.kill()
+            else:
+                p.terminate()
+            # Wait a bit for process to die
+            try:
+                p.wait(timeout=2)
+            except psutil.TimeoutExpired:
+                if not force:
+                    p.kill()  # Force kill if normal termination times out
+            log.info(f"Killed process PID {pid}: {p.name()}")
+            return True
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired) as e:
+            log.warning(f"Could not kill process {pid}: {e}")
+            return False
+
+    # ── APP DISCOVERY & MANAGEMENT ──────────────────────
+    def _find_app_executable(self, app: str) -> Optional[str]:
+        """Find app executable in common locations and registry."""
+        # Try registered apps first
+        cmds = self.APP_MAP.get(app)
+        if cmds:
+            for cmd in cmds:
+                if Path(cmd).exists():
+                    return cmd
+                try:
+                    result = subprocess.run(["where", cmd], capture_output=True, text=True, timeout=3)
+                    if result.returncode == 0:
+                        return result.stdout.strip().split('\n')[0]
+                except Exception:
+                    pass
+
+        # Search in Program Files
+        search_paths = [
+            os.environ.get("ProgramFiles", r"C:\Program Files"),
+            os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+            os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")),
+        ]
+        exe_name = app + ".exe"
+        for base in search_paths:
+            try:
+                for root, dirs, files in os.walk(base):
+                    if exe_name in files:
+                        return os.path.join(root, exe_name)
+            except (PermissionError, OSError):
+                continue
+
+        # Try Windows Registry
+        try:
+            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows\CurrentVersion\Uninstall")
+            for i in range(winreg.QueryInfoKey(key)[0]):
+                subkey_name = winreg.EnumKey(key, i)
+                subkey = winreg.OpenKey(key, subkey_name)
+                try:
+                    display_name = winreg.QueryValueEx(subkey, "DisplayName")[0].lower()
+                    if app in display_name:
+                        try:
+                            exe_path = winreg.QueryValueEx(subkey, "InstallLocation")[0]
+                            if exe_path and os.path.exists(exe_path):
+                                return exe_path
+                        except WindowsError:
+                            pass
+                except WindowsError:
+                    pass
+        except Exception:
+            pass
+        return None
+
     # ── BROWSER / APP LAUNCH ─────────────────────────────
     def _open_app(self, a: dict, raw: str) -> ActionResult:
         app = a.get("app", "").lower().strip()
         url  = a.get("url") or a.get("search") or ""
+        args = a.get("args", "")
+
+        # Intelligent app name matching and normalization
+        app = self._normalize_and_match_app(app)
 
         # Browser with optional URL
         browsers = {"chrome", "firefox", "edge", "brave"}
@@ -263,20 +487,27 @@ class ActionExecutor:
             "display settings":  "ms-settings:display",
             "sound settings":    "ms-settings:sound",
             "apps settings":     "ms-settings:appsfeatures",
+            "camera":            "microsoft.windows.camera:",
+            "calculator":        "calculator:",
         }
         if app in settings_map:
-            os.startfile(settings_map[app])
-            return ActionResult(True, f"Opened {app}")
+            try:
+                os.startfile(settings_map[app])
+                return ActionResult(True, f"Opened {app}")
+            except Exception as e:
+                return ActionResult(False, f"Could not open {app}: {e}")
 
-        # Registered app
-        cmds = self.APP_MAP.get(app)
-        if cmds:
-            for cmd in cmds:
-                try:
-                    subprocess.Popen([cmd], shell=True)
-                    return ActionResult(True, f"Opened {app}")
-                except FileNotFoundError:
-                    continue
+        # Try to find and open the app
+        exe_path = self._find_app_executable(app)
+        if exe_path:
+            try:
+                if args:
+                    subprocess.Popen([exe_path, args], shell=True)
+                else:
+                    subprocess.Popen([exe_path], shell=True)
+                return ActionResult(True, f"Opened {app}")
+            except Exception as e:
+                return ActionResult(False, f"Could not launch {app}: {e}")
 
         # Last resort: shell
         try:
@@ -287,20 +518,133 @@ class ActionExecutor:
 
     def _close_app(self, a: dict, raw: str) -> ActionResult:
         app = a.get("app", "").lower()
-        proc_map = {
-            "chrome": "chrome.exe",  "firefox": "firefox.exe",
-            "edge": "msedge.exe",    "notepad": "notepad.exe",
-            "calculator": "calculator.exe", "vlc": "vlc.exe",
-            "discord": "discord.exe","spotify": "spotify.exe",
-            "code": "Code.exe",      "teams": "Teams.exe",
+        force = a.get("force", True)  # Force close by default
+
+        # Intelligent app name matching and normalization
+        app = self._normalize_and_match_app(app)
+        log.info(f"Attempting to close: {app}")
+
+        # Apps that truly cannot be closed
+        uncloseables = set()  # Actually, most apps CAN be closed!
+        if app in uncloseables:
+            return ActionResult(False, f"System app '{app}' cannot be closed.")
+
+        # Step 1: Try specific exe names from our maps
+        special_map = {
+            "settings": ["SystemSettings.exe", "SettingsApp.exe", "Settings.exe"],
+            "camera": ["cameracapture.exe", "WindowsCamera.exe", "Camera.exe"],
+            "notepad": ["notepad.exe", "notepad++.exe"],
+            "calculator": ["calculator.exe", "calc.exe"],
+            "explorer": ["explorer.exe"],
         }
-        proc = proc_map.get(app, app + ".exe")
+
+        proc_map = {
+            "chrome": ["chrome.exe"],  "firefox": ["firefox.exe"],
+            "edge": ["msedge.exe"],    "notepad": ["notepad.exe"],
+            "calculator": ["calculator.exe"], "vlc": ["vlc.exe"],
+            "discord": ["discord.exe"], "spotify": ["spotify.exe"],
+            "code": ["Code.exe"],      "teams": ["Teams.exe"],
+        }
+
+        procs_to_try = special_map.get(app) or proc_map.get(app) or [app + ".exe", app]
+        flag = "/f" if force else ""
+        
+        for proc in procs_to_try:
+            result = subprocess.run(["taskkill", flag, "/im", proc],
+                                   capture_output=True, text=True, check=False)
+            if result.returncode == 0:
+                time.sleep(0.3)
+                log.info(f"Taskkill succeeded for: {proc}")
+                return ActionResult(True, f"Closed {app}", speak=f"Closed {app}")
+
+        # Step 2: Use intelligent process finder
+        log.info(f"Using intelligent process finder for: {app}")
+        pids = self._find_processes_by_name(app)
+        
+        if pids:
+            killed = 0
+            for pid in pids:
+                if self._kill_process_by_pid(pid, force):
+                    killed += 1
+            
+            if killed > 0:
+                time.sleep(0.3)
+                log.info(f"Successfully killed {killed} process(es)")
+                return ActionResult(True, f"Closed {app}", speak=f"Closed {app}")
+
+        # Step 3: Last resort - PowerShell for stubborn apps
+        log.info(f"Trying PowerShell for: {app}")
         try:
-            subprocess.run(["taskkill", "/f", "/im", proc],
-                           capture_output=True, check=False)
-            return ActionResult(True, f"Closed {app}")
+            # Try to kill by process name pattern
+            ps_commands = [
+                f"Get-Process | Where-Object {{$_.Name -like '*{app}*'}} | Stop-Process -Force -ErrorAction SilentlyContinue",
+                f"Get-Process *{app}* -ErrorAction SilentlyContinue | Stop-Process -Force",
+            ]
+            
+            for ps_cmd in ps_commands:
+                result = subprocess.run(
+                    ["PowerShell", "-NoProfile", "-Command", ps_cmd],
+                    capture_output=True, text=True, check=False, timeout=5
+                )
+                if result.returncode == 0 or "Stop-Process" in result.stdout:
+                    time.sleep(0.5)
+                    log.info(f"PowerShell close succeeded for: {app}")
+                    return ActionResult(True, f"Closed {app}", speak=f"Closed {app}")
         except Exception as e:
-            return ActionResult(False, f"Could not close {app}: {e}")
+            log.warning(f"PowerShell close failed: {e}")
+
+        log.warning(f"Could not close {app}: no running process found")
+        return ActionResult(False, f"Could not close {app}: app not running or access denied.")
+
+    def _restart_app(self, a: dict, raw: str) -> ActionResult:
+        """Close and reopen an app."""
+        app = a.get("app", "").lower().strip()
+        app = self._normalize_and_match_app(app)  # Intelligent matching
+        delay = int(a.get("delay", 1))  # Delay in seconds before reopening
+
+        # Close
+        close_result = self._close_app({"app": app}, raw)
+        if not close_result.success:
+            return ActionResult(False, f"Could not restart {app}: close failed")
+
+        # Wait and reopen
+        time.sleep(delay)
+        return self._open_app({"app": app}, raw)
+
+    def _list_apps(self, a: dict, raw: str) -> ActionResult:
+        """List all running processes/apps."""
+        try:
+            running = []
+            for p in psutil.process_iter(['name']):
+                try:
+                    running.append(p.info['name'])
+                except psutil.NoSuchProcess:
+                    pass
+            running = sorted(set(running))[:15]  # Top 15 unique apps
+            text = ", ".join(running[:10])
+            return ActionResult(True, f"Running: {text}",
+                              speak=f"Found {len(running)} running processes")
+        except Exception as e:
+            return ActionResult(False, f"Could not list apps: {e}")
+
+    def _app_status(self, a: dict, raw: str) -> ActionResult:
+        """Check if an app is running."""
+        app = a.get("app", "").lower()
+        app = self._normalize_and_match_app(app)  # Intelligent matching
+        app_clean = app.replace(" ", "").lower()
+        try:
+            for p in psutil.process_iter(['name']):
+                try:
+                    name = p.info['name'].lower()
+                    if app in name or app_clean in name.replace(" ", ""):
+                        return ActionResult(True, f"{app} is running",
+                                          speak=f"{app} is currently running")
+                except psutil.NoSuchProcess:
+                    continue
+            return ActionResult(False, f"{app} is not running",
+                              speak=f"{app} is not currently running")
+        except Exception as e:
+            return ActionResult(False, f"Could not check status: {e}")
 
     # ── WEB ──────────────────────────────────────────────
     def _search_web(self, a: dict, raw: str) -> ActionResult:

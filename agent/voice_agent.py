@@ -1282,48 +1282,173 @@ class StatusHUD:
 # ══════════════════════════════════════════════════════════
 class ProVoiceAgent:
 
+    # Agent states
+    STATES = {
+        "STOPPED": 0,
+        "IDLE": 1,
+        "ACTIVE": 2,
+        "EXECUTING": 3,
+    }
+
     EXIT_PHRASES = {
-        "exit agent", "quit agent", "stop agent",
-        "goodbye agent", "shutdown agent", "bye agent",
-        "close agent",
+        "goodbye lucifer",
+        "stop lucifer",
+        "lucifer stop",
+        "lucifer goodbye",
+        "lucifer quit",
+        "quit lucifer",
+        "lucifer exit",
+        "exit lucifer",
+    }
+
+    START_PHRASES = {
+        "start lucifer",
+        "lucifer start",
+        "activate lucifer",
+        "lucifer activate",
+        "launch lucifer",
+        "lucifer launch",
+    }
+
+    ACTIVATION_PHRASES = {
+        "hello lucifer",
+        "lucifer",
+        "activate agent",
+        "agent activate",
+        "wake up lucifer",
+        "lucifer wake up",
     }
 
     def __init__(self):
-        log.info("╔══════════════════════════════╗")
-        log.info("║  ProVoiceAgent  Starting…    ║")
-        log.info("╚══════════════════════════════╝")
+        log.info("╔══════════════════════════════════════════╗")
+        log.info("║     ProVoiceAgent - LUCIFER MODE        ║")
+        log.info("╚══════════════════════════════════════════╝")
 
         self.tts      = TTSEngine()
         self.voice    = VoiceEngine(self.tts)
         self.brain    = AgentBrain()
         self.executor = ActionExecutor(self.tts)
         self.hud      = StatusHUD()
+        
+        # State management
+        self._state = self.STATES["STOPPED"]
         self._running = False
+        self._activated = False
+        
+        log.info(f"Agent initialized in STOPPED state")
+
+    def _get_state_name(self) -> str:
+        """Get human-readable state name."""
+        for name, value in self.STATES.items():
+            if value == self._state:
+                return name
+        return "UNKNOWN"
 
     def start(self):
+        """Main entry point - wait for startup command."""
         self.hud.start()
-        self.hud.show("ProVoiceAgent starting…", "processing")
+        self._state = self.STATES["IDLE"]
+        
+        self.hud.show("🛑  STOPPED - Say 'Start Lucifer'", "ready")
+        log.info(f"Agent state: {self._get_state_name()}")
 
         self.tts.speak_sync(
-            "Pro Voice Agent is now active. "
-            "I'm listening for your commands. How can I help you?"
+            "Lucifer is offline. Say 'Start Lucifer' to activate."
         )
 
         self._running = True
-        log.info("Agent is live — waiting for voice commands.")
+        log.info("Waiting for startup command...")
 
         while self._running:
             try:
-                self._cycle()
+                if self._state == self.STATES["IDLE"]:
+                    self._wait_for_startup()
+                elif self._state == self.STATES["ACTIVE"]:
+                    self._wait_for_activation()
+                elif self._state == self.STATES["EXECUTING"]:
+                    self._execute_single_command()
+                else:
+                    time.sleep(0.5)
             except KeyboardInterrupt:
-                self._quit()
+                self._shutdown()
             except Exception as e:
                 log.error(f"Cycle error: {e}", exc_info=True)
-                self.hud.show(f"Error: {str(e)[:40]}", "error")
+                self.hud.show(f"❌ Error: {str(e)[:40]}", "error")
                 time.sleep(1)
 
-    def _cycle(self):
-        self.hud.show("🎤  Listening…", "listening")
+    def _wait_for_startup(self):
+        """Wait for 'Start Lucifer' command to boot the agent."""
+        self.hud.show("🛑  STOPPED - Say 'Start Lucifer'", "ready")
+        log.info(f"State: {self._get_state_name()} - Waiting for startup...")
+
+        text = self.voice.listen(
+            timeout=AGENT_CONFIG.get("listen_timeout", 30),
+            phrase_limit=AGENT_CONFIG.get("phrase_limit", 10),
+        )
+
+        if not text:
+            return
+
+        text_lower = text.lower()
+        
+        # Check for startup command
+        if text_lower in self.START_PHRASES or "start" in text_lower.lower():
+            self._boot_agent()
+            return
+
+        # Check for exit command
+        if text_lower in self.EXIT_PHRASES or "stop" in text_lower:
+            log.info("Received stop command in STOPPED state")
+            self._shutdown()
+            return
+
+        log.info(f"Ignored (not startup): \"{text}\"")
+
+    def _boot_agent(self):
+        """Boot the agent - transition from IDLE to ACTIVE."""
+        self._state = self.STATES["ACTIVE"]
+        self.hud.show("⚡  ONLINE - Lucifer ready!", "processing")
+        self.tts.speak("Lucifer is now online. Say 'Hello Lucifer' for commands.")
+        log.info(f"Agent BOOTED → State: {self._get_state_name()}")
+        time.sleep(0.8)
+
+    def _wait_for_activation(self):
+        """Active state: Wait for 'Hello Lucifer' to execute commands."""
+        self.hud.show("👀  ONLINE (say 'Hello Lucifer')", "ready")
+
+        text = self.voice.listen(
+            timeout=AGENT_CONFIG.get("listen_timeout", 30),
+            phrase_limit=AGENT_CONFIG.get("phrase_limit", 10),
+        )
+
+        if not text:
+            return
+
+        text_lower = text.lower()
+        
+        # Check for exit command
+        if text_lower in self.EXIT_PHRASES or "stop" in text_lower:
+            self._shutdown()
+            return
+
+        # Check for activation (command execution)
+        if text_lower in self.ACTIVATION_PHRASES or "hello" in text_lower or "activate" in text_lower:
+            self._activate_for_command()
+            return
+
+        log.info(f"Ignored (not activation): \"{text}\"")
+        self.hud.show("👀  ONLINE (not recognized)", "ready")
+
+    def _activate_for_command(self):
+        """Activate for ONE command execution."""
+        self._state = self.STATES["EXECUTING"]
+        self.hud.show("🎤  LISTENING for command", "processing")
+        self.tts.speak("Ready. What do you need?")
+        log.info(f"Agent ACTIVATED → State: {self._get_state_name()}")
+
+    def _execute_single_command(self):
+        """Listen for ONE command and execute it."""
+        self.hud.show("🎤  LISTENING for command…", "listening")
 
         text = self.voice.listen(
             timeout=AGENT_CONFIG.get("listen_timeout", 15),
@@ -1331,14 +1456,15 @@ class ProVoiceAgent:
         )
 
         if not text:
+            self._return_to_active("No command detected")
             return
 
         # Exit check
-        if text.lower() in self.EXIT_PHRASES:
-            self._quit()
+        if text.lower() in self.EXIT_PHRASES or "stop" in text.lower():
+            self._shutdown()
             return
 
-        log.info(f"📝  User: \"{text}\"")
+        log.info(f"📝  Command: \"{text}\"")
         self.hud.show(f"🧠  {text[:42]}…", "processing")
 
         # Parse intent
@@ -1360,7 +1486,26 @@ class ProVoiceAgent:
         icon   = "✅" if result.success else "❌"
         state  = "success" if result.success else "error"
         self.hud.show(f"{icon}  {result.message[:48]}", state)
-        time.sleep(0.6)
+        time.sleep(0.8)
+        
+        # Return to active after command execution
+        self._return_to_active("Command executed")
+
+    def _return_to_active(self, reason: str = ""):
+        """Return from EXECUTING to ACTIVE state."""
+        self._state = self.STATES["ACTIVE"]
+        msg = f"Returned to active. ({reason})" if reason else "Returned to active."
+        log.info(f"Agent returned to ACTIVE: {reason}")
+        self.hud.show("👀  ONLINE (say 'Hello Lucifer')", "ready")
+        time.sleep(0.5)
+
+    def _shutdown(self):
+        """Graceful shutdown - transition back to IDLE (waiting for restart)."""
+        self._state = self.STATES["IDLE"]
+        log.info(f"Agent SHUTDOWN → State: {self._get_state_name()}")
+        self.hud.show("🛑  OFFLINE - Say 'Start Lucifer' to restart", "ready")
+        self.tts.speak_sync("Lucifer going offline. Say 'Start Lucifer' to restart.")
+        time.sleep(0.5)
 
     def _action_summary(self, action: dict) -> str:
         a = action.get("action", "")
@@ -1377,13 +1522,6 @@ class ProVoiceAgent:
         if a == "calculate":
             return action.get("expression", "")
         return ""
-
-    def _quit(self):
-        log.info("Shutting down ProVoiceAgent…")
-        self.hud.show("Goodbye! Shutting down…", "processing")
-        self.tts.speak_sync("Goodbye! Pro Voice Agent is shutting down.")
-        self._running = False
-        sys.exit(0)
 
 
 # ══════════════════════════════════════════════════════════

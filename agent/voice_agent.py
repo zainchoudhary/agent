@@ -33,6 +33,7 @@ GROQ_API_KEY = os.getenv('GROQ_API_KEY')
 # LOGGING
 # ══════════════════════════════════════════════════════════
 LOG_DIR = Path.home() / ".provoiceagent" / "logs"
+
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(

@@ -285,6 +285,9 @@ class ActionExecutor:
         "settings": "settings",
         "camera app": "camera",
         "webcam": "camera",
+        "postman api": "postman",
+        "api client": "postman",
+        "rest client": "postman",
     }
 
     # ── Search engine table ───────────────────────────────
@@ -304,7 +307,8 @@ class ActionExecutor:
         self.tts = tts
         pyautogui.FAILSAFE = True
         pyautogui.PAUSE = 0.05
-
+        self._app_cache = {}  # Cache for discovered apps
+        
         # Register handlers - ENTERPRISE LEVEL (50+ actions)
         self._handlers = {
             # App Management
@@ -378,6 +382,9 @@ class ActionExecutor:
             "click":            self._click,
             "set_reminder":     self._set_reminder,
         }
+        
+        # Build system app cache on startup
+        threading.Thread(target=self._cache_all_installed_apps, daemon=True).start()
 
     def execute(self, action: Dict[str, Any], raw_text: str) -> ActionResult:
         act = action.get("action", "paste_text")
@@ -389,48 +396,34 @@ class ActionExecutor:
             log.error(f"Action error [{act}]: {e}", exc_info=True)
             return ActionResult(False, f"Error in {act}: {e}")
 
-    # ── INTELLIGENT APP NAME MATCHING ──────────────────────
+    # ── INTELLIGENT APP NAME MATCHING (DYNAMIC) ──────────────────────
     def _normalize_and_match_app(self, app_input: str) -> str:
-        """Intelligently match app name using aliases and fuzzy matching."""
+        """Match app name using dynamic cache and fuzzy matching."""
         if not app_input:
             return app_input
         
         app = app_input.lower().strip()
         
-        # Step 1: Direct alias match
-        if app in self.APP_ALIASES:
-            matched = self.APP_ALIASES[app]
-            log.info(f"App alias match: '{app_input}' → '{matched}'")
-            return matched
+        # Direct cache match
+        if app in self._app_cache:
+            return app
         
-        # Step 2: Fuzzy match against known apps
+        # Fuzzy match in cache
         from difflib import SequenceMatcher
-        all_known_apps = list(self.APP_MAP.keys()) + list(self.APP_ALIASES.keys())
         best_match = None
-        best_ratio = 0.6  # Threshold for fuzzy match
+        best_ratio = 0.7
         
-        for known_app in all_known_apps:
-            ratio = SequenceMatcher(None, app, known_app).ratio()
+        for cached_app in self._app_cache.keys():
+            ratio = SequenceMatcher(None, app, cached_app).ratio()
             if ratio > best_ratio:
                 best_ratio = ratio
-                best_match = known_app
+                best_match = cached_app
         
         if best_match:
-            final = self.APP_ALIASES.get(best_match, best_match)
-            log.info(f"App fuzzy match: '{app_input}' → '{final}' (confidence: {best_ratio:.0%})")
-            return final
+            log.info(f"App fuzzy match: '{app_input}' → '{best_match}' ({best_ratio:.0%})")
+            return best_match
         
-        # Step 3: Try to match just the main word
-        words = app.split()
-        if len(words) > 1:
-            # If name has multiple words, try matching the longest/most descriptive word
-            for word in sorted(words, key=len, reverse=True):
-                if word in self.APP_ALIASES:
-                    matched = self.APP_ALIASES[word]
-                    log.info(f"App word match: '{app_input}' → '{matched}'")
-                    return matched
-        
-        # Step 4: Return normalized version
+        # Return as-is for shell execution
         return app
 
     # ── INTELLIGENT PROCESS MANAGEMENT ──────────────────────
@@ -492,68 +485,186 @@ class ActionExecutor:
             log.warning(f"Could not kill process {pid}: {e}")
             return False
 
-    # ── APP DISCOVERY & MANAGEMENT ──────────────────────
-    def _find_app_executable(self, app: str) -> Optional[str]:
-        """Find app executable in common locations and registry."""
-        # Try registered apps first
-        cmds = self.APP_MAP.get(app)
-        if cmds:
-            for cmd in cmds:
-                if Path(cmd).exists():
-                    return cmd
-                try:
-                    result = subprocess.run(["where", cmd], capture_output=True, text=True, timeout=3)
-                    if result.returncode == 0:
-                        return result.stdout.strip().split('\n')[0]
-                except Exception:
-                    pass
-
-        # Search in Program Files
-        search_paths = [
-            os.environ.get("ProgramFiles", r"C:\Program Files"),
-            os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
-            os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")),
-        ]
-        exe_name = app + ".exe"
-        for base in search_paths:
-            try:
-                for root, dirs, files in os.walk(base):
-                    if exe_name in files:
-                        return os.path.join(root, exe_name)
-            except (PermissionError, OSError):
-                continue
-
-        # Try Windows Registry
+    def _cache_all_installed_apps(self):
+        """Scan entire system and build cache of ALL installed apps."""
+        log.info("🔍 Building system app cache...")
+        
+        # ─── Scan Windows Registry ─────────────────────────────────────
         try:
             key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows\CurrentVersion\Uninstall")
             for i in range(winreg.QueryInfoKey(key)[0]):
-                subkey_name = winreg.EnumKey(key, i)
-                subkey = winreg.OpenKey(key, subkey_name)
                 try:
-                    display_name = winreg.QueryValueEx(subkey, "DisplayName")[0].lower()
-                    if app in display_name:
+                    subkey_name = winreg.EnumKey(key, i)
+                    subkey = winreg.OpenKey(key, subkey_name)
+                    display_name = winreg.QueryValueEx(subkey, "DisplayName")[0]
+                    exe_path = None
+                    
+                    # Try to get executable path
+                    try:
+                        exe_path = winreg.QueryValueEx(subkey, "InstallLocation")[0]
+                    except:
                         try:
-                            exe_path = winreg.QueryValueEx(subkey, "InstallLocation")[0]
-                            if exe_path and os.path.exists(exe_path):
-                                return exe_path
-                        except WindowsError:
+                            exe_path = winreg.QueryValueEx(subkey, "UninstallString")[0]
+                        except:
                             pass
-                except WindowsError:
+                    
+                    if display_name:
+                        app_key = display_name.lower().split()[0]  # Use first word as key
+                        self._app_cache[app_key] = exe_path
+                        self._app_cache[display_name.lower()] = exe_path
+                except:
                     pass
+        except Exception as e:
+            log.warning(f"Could not scan registry: {e}")
+        
+        # ─── Scan Program Files & AppData ─────────────────────────────
+        search_paths = [
+            r"C:\Program Files",
+            r"C:\Program Files (x86)",
+            str(Path.home() / "AppData" / "Local"),
+            str(Path.home() / "AppData" / "Roaming"),
+        ]
+        
+        for base_path in search_paths:
+            if not os.path.exists(base_path):
+                continue
+            try:
+                for root, dirs, files in os.walk(base_path, topdown=True):
+                    # Limit search depth for performance
+                    dirs[:] = dirs[:5]
+                    for file in files:
+                        if file.endswith(".exe"):
+                            app_name = file[:-4].lower()  # Remove .exe
+                            full_path = os.path.join(root, file)
+                            self._app_cache[app_name] = full_path
+            except (PermissionError, OSError):
+                continue
+        
+        # ─── Scan Desktop for shortcuts (.lnk files) ──────────────────
+        desktop_path = Path.home() / "Desktop"
+        if desktop_path.exists():
+            try:
+                for item in desktop_path.iterdir():
+                    if item.is_file():
+                        # Handle .lnk shortcuts
+                        if item.suffix.lower() == ".lnk":
+                            app_name = item.stem.lower()  # Name without extension
+                            self._app_cache[app_name] = str(item)
+                        # Handle direct executables on desktop
+                        elif item.suffix.lower() == ".exe":
+                            app_name = item.stem.lower()
+                            self._app_cache[app_name] = str(item)
+            except Exception as e:
+                log.warning(f"Could not scan Desktop: {e}")
+        
+        # ─── Scan Start Menu for app shortcuts ─────────────────────────
+        start_menu_paths = [
+            Path.home() / "AppData" / "Roaming" / "Microsoft" / "Windows" / "Start Menu" / "Programs",
+            Path(r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs"),
+        ]
+        
+        for start_menu in start_menu_paths:
+            if not start_menu.exists():
+                continue
+            try:
+                for item in start_menu.rglob("*.lnk"):  # Recursive search
+                    app_name = item.stem.lower()
+                    self._app_cache[app_name] = str(item)
+            except Exception as e:
+                log.warning(f"Could not scan Start Menu: {e}")
+        
+        # ─── Scan user home directory for portable/custom apps ────────
+        home_subfolders = ["Downloads", "Documents", "Desktop"]
+        for subfolder in home_subfolders:
+            folder_path = Path.home() / subfolder
+            if folder_path.exists():
+                try:
+                    for root, dirs, files in os.walk(folder_path, topdown=True):
+                        dirs[:] = dirs[:3]  # Limit depth
+                        for file in files:
+                            if file.endswith(".exe"):
+                                app_name = file[:-4].lower()
+                                full_path = os.path.join(root, file)
+                                self._app_cache[app_name] = full_path
+                except (PermissionError, OSError):
+                    continue
+        
+        log.info(f"✅ App cache built: {len(self._app_cache)} apps indexed")
+
+    def _resolve_shortcut(self, shortcut_path: str) -> Optional[str]:
+        """Resolve a .lnk (Windows shortcut) to the target executable."""
+        try:
+            import win32com.client
+            shell = win32com.client.Dispatch("WScript.Shell")
+            shortcut = shell.CreateShortcut(shortcut_path)
+            target_path = shortcut.TargetPath
+            if target_path and os.path.exists(target_path):
+                return target_path
         except Exception:
             pass
         return None
 
-    # ── BROWSER / APP LAUNCH ─────────────────────────────
+    def _find_app_executable(self, app: str) -> Optional[str]:
+        """Find app executable - checks cache first, then system."""
+        from difflib import SequenceMatcher
+        
+        app_lower = app.lower().strip()
+        
+        # Step 1: Direct cache lookup
+        if app_lower in self._app_cache:
+            path = self._app_cache[app_lower]
+            # If it's a shortcut, resolve it
+            if path and path.lower().endswith(".lnk"):
+                resolved = self._resolve_shortcut(path)
+                if resolved:
+                    return resolved
+                return path  # Return shortcut if resolution fails
+            if path and os.path.exists(path):
+                return path
+        
+        # Step 2: Fuzzy match in cache
+        best_match = None
+        best_ratio = 0.7
+        for cached_app, path in self._app_cache.items():
+            ratio = SequenceMatcher(None, app_lower, cached_app).ratio()
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_match = path
+                log.info(f"Fuzzy matched: '{app}' → '{cached_app}' ({best_ratio:.0%})")
+        
+        if best_match:
+            if best_match.lower().endswith(".lnk"):
+                resolved = self._resolve_shortcut(best_match)
+                if resolved:
+                    return resolved
+            if os.path.exists(best_match):
+                return best_match
+        
+        # Step 3: Try system PATH lookup
+        try:
+            result = subprocess.run(["where", app_lower], capture_output=True, text=True, timeout=3)
+            if result.returncode == 0:
+                path = result.stdout.strip().split('\n')[0]
+                self._app_cache[app_lower] = path
+                return path
+        except Exception:
+            pass
+        
+        # Step 4: Try direct shell execution (system will find it)
+        return None
+
+    # ── UNIVERSAL APP LAUNCHER ─────────────────────────────
     def _open_app(self, a: dict, raw: str) -> ActionResult:
         app = a.get("app", "").lower().strip()
         url  = a.get("url") or a.get("search") or ""
         args = a.get("args", "")
 
-        # Intelligent app name matching and normalization
-        app = self._normalize_and_match_app(app)
+        if not app:
+            return ActionResult(False, "No app specified")
 
-        # Web-only services that don't have desktop apps
+        log.info(f"🚀 Attempting to open: {app}")
+
+        # Web-only services (open in browser)
         web_services = {
             "youtube":    "https://www.youtube.com",
             "facebook":   "https://www.facebook.com",
@@ -573,26 +684,12 @@ class ActionExecutor:
             "ebay":       "https://www.ebay.com",
         }
         
-        # If it's a web service, open in browser
         if app in web_services:
-            target = web_services[app]
             try:
-                webbrowser.open(target)
-            except Exception:
-                pass
-            return ActionResult(True, f"Opened {app}", speak=f"Opening {app}")
-
-        # Browser with optional URL
-        browsers = {"chrome", "firefox", "edge", "brave"}
-        if app in browsers:
-            target = url if url else "https://www.google.com"
-            if target and not target.startswith("http"):
-                target = "https://" + target
-            try:
-                webbrowser.get(app).open(target)
-            except Exception:
-                webbrowser.open(target)
-            return ActionResult(True, f"Opened {app}" + (f" → {target}" if url else ""))
+                webbrowser.open(web_services[app])
+                return ActionResult(True, f"Opened {app}", speak=f"Opening {app}")
+            except Exception as e:
+                return ActionResult(False, f"Could not open {app}: {e}")
 
         # System settings shortcuts
         settings_map = {
@@ -612,24 +709,55 @@ class ActionExecutor:
             except Exception as e:
                 return ActionResult(False, f"Could not open {app}: {e}")
 
-        # Try to find and open the app
+        # Browser with optional URL
+        browsers = {"chrome", "firefox", "edge", "brave", "opera"}
+        if app in browsers:
+            target = url if url else "https://www.google.com"
+            if target and not target.startswith("http"):
+                target = "https://" + target
+            try:
+                webbrowser.get(app).open(target)
+                return ActionResult(True, f"Opened {app}" + (f" → {target}" if url else ""))
+            except Exception:
+                try:
+                    webbrowser.open(target)
+                    return ActionResult(True, f"Opened {app}")
+                except Exception as e:
+                    return ActionResult(False, f"Could not launch {app}: {e}")
+
+        # Try to find and open the app from cache
         exe_path = self._find_app_executable(app)
         if exe_path:
             try:
-                if args:
-                    subprocess.Popen([exe_path, args], shell=True)
+                # Handle .lnk shortcuts with os.startfile (native Windows support)
+                if exe_path.lower().endswith(".lnk"):
+                    os.startfile(exe_path)
+                    log.info(f"✅ Launched shortcut: {exe_path}")
+                    return ActionResult(True, f"Opened {app}", speak=f"Opening {app}")
+                # Handle regular executables
                 else:
-                    subprocess.Popen([exe_path], shell=True)
-                return ActionResult(True, f"Opened {app}")
+                    if args:
+                        subprocess.Popen([exe_path] + args.split(), shell=False)
+                    else:
+                        subprocess.Popen([exe_path], shell=False)
+                    log.info(f"✅ Launched from path: {exe_path}")
+                    return ActionResult(True, f"Opened {app}", speak=f"Opening {app}")
             except Exception as e:
-                return ActionResult(False, f"Could not launch {app}: {e}")
+                log.warning(f"Failed to launch from path: {e}")
 
-        # Last resort: shell
+        # Last resort: shell execution (Windows will search PATH and registry)
+        log.info(f"Attempting shell execution for: {app}")
         try:
-            subprocess.Popen(app, shell=True)
-            return ActionResult(True, f"Launched: {app}")
+            if args:
+                subprocess.Popen(f"{app} {args}", shell=True)
+            else:
+                subprocess.Popen(app, shell=True)
+            log.info(f"✅ Executed via shell: {app}")
+            return ActionResult(True, f"Launched {app}", speak=f"Opening {app}")
         except Exception as e:
-            return ActionResult(False, f"Could not open '{app}': {e}")
+            log.error(f"❌ Failed to open {app}: {e}")
+            return ActionResult(False, f"Could not open '{app}' - app not found", speak=f"Could not find {app}")
+
 
     def _close_app(self, a: dict, raw: str) -> ActionResult:
         app = a.get("app", "").lower()

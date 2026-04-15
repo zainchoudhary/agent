@@ -6,3 +6,7 @@ pyttsx3
 pyperclip
 pyautogui
 pyaudio
+psutil
+requests
+python-dotenv
+Pillow

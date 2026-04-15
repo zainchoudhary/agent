@@ -1,6 +1,12 @@
 
 import logging
-from .voice_agent import ProVoiceAgent
+import sys
+from pathlib import Path
+
+# Add parent directory to path for relative imports
+sys.path.insert(0, str(Path(__file__).parent))
+
+from voice_agent import ProVoiceAgent
 
 # Configure logging
 logging.basicConfig(

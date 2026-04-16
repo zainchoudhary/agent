@@ -8,18 +8,23 @@ import threading
 import subprocess
 import webbrowser
 import queue
-from datetime import datetime
+import psutil
+import winreg
+import ctypes
+import socket
+import hashlib
+from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
+from collections import defaultdict
+import shutil
 
 import pyperclip
 import pyautogui
 import requests
 import speech_recognition as sr
 import pyttsx3
-import psutil
-import winreg
 
 # Add agent directory to sys.path for imports
 sys.path.insert(0, str(Path(__file__).parent))
@@ -28,20 +33,19 @@ from config import AGENT_CONFIG
 
 # Load .env and get GROQ_API_KEY
 from dotenv import load_dotenv
-load_dotenv()  # Load .env file for secrets (GROQ_API_KEY)
+load_dotenv()
 load_dotenv(dotenv_path=Path(__file__).parent.parent / '.env')
 GROQ_API_KEY = os.getenv('GROQ_API_KEY')
 
 # ══════════════════════════════════════════════════════════
-# LOGGING
+# LOGGING CONFIGURATION
 # ══════════════════════════════════════════════════════════
 LOG_DIR = Path.home() / ".provoiceagent" / "logs"
-
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(message)s",  # ASCII pipe to avoid UnicodeEncodeError
+    format="%(asctime)s | %(levelname)-8s | %(message)s",
     handlers=[
         logging.FileHandler(LOG_DIR / f"agent_{datetime.now().strftime('%Y%m%d')}.log", encoding="utf-8"),
         logging.StreamHandler(sys.stdout),
@@ -58,8 +62,7 @@ class ActionResult:
     success: bool
     message: str
     data: Optional[Any] = None
-    speak: Optional[str] = None   # what the agent should say aloud
-
+    speak: Optional[str] = None
 
 @dataclass
 class ConversationTurn:
@@ -67,9 +70,199 @@ class ConversationTurn:
     content: str
     timestamp: datetime = field(default_factory=datetime.now)
 
+@dataclass
+class SystemState:
+    """Complete snapshot of system state"""
+    timestamp: datetime
+    cpu_percent: float
+    ram_percent: float
+    disk_percent: float
+    running_apps: List[str]
+    recent_files: List[str]
+    network_status: Dict[str, Any]
+    battery_info: Optional[Dict[str, Any]]
+
 
 # ══════════════════════════════════════════════════════════
-# TTS ENGINE
+# ADVANCED SYSTEM INTELLIGENCE
+# ══════════════════════════════════════════════════════════
+class SystemIntelligence:
+    """Deep system analysis and context awareness"""
+    
+    def __init__(self):
+        self.system_state_history = []
+        self.app_usage_tracker = defaultdict(lambda: {"launches": 0, "total_time": 0, "last_used": None})
+        self.file_access_log = []
+        self.network_log = []
+        self._cache_invalidate_time = 30  # seconds
+        self._last_system_scan = None
+        
+    def get_complete_system_info(self) -> Dict[str, Any]:
+        """Get comprehensive system information"""
+        try:
+            # CPU & Memory
+            cpu_percent = psutil.cpu_percent(interval=0.5, percpu=True)
+            ram = psutil.virtual_memory()
+            disk = psutil.disk_usage('/')
+            
+            # Network info
+            net_io = psutil.net_io_counters()
+            network_interfaces = psutil.net_if_addrs()
+            
+            # Battery
+            battery = None
+            try:
+                bat = psutil.sensors_battery()
+                if bat:
+                    battery = {
+                        "percent": bat.percent,
+                        "charging": bat.power_plugged,
+                        "time_left": str(bat.secsleft) if bat.secsleft != psutil.POWER_TIME_UNLIMITED else "Plugged in"
+                    }
+            except:
+                pass
+            
+            # Processes
+            running_processes = {}
+            for proc in psutil.process_iter(['pid', 'name', 'memory_percent']):
+                try:
+                    pinfo = proc.as_dict(attrs=['pid', 'name', 'memory_percent'])
+                    if pinfo['memory_percent'] > 0.5:  # Only significant consumers
+                        running_processes[pinfo['name']] = {
+                            "pid": pinfo['pid'],
+                            "memory_mb": round(pinfo['memory_percent'] * ram.total / 100 / 1024**2, 1)
+                        }
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            
+            return {
+                "timestamp": datetime.now().isoformat(),
+                "cpu": {
+                    "percent_per_core": cpu_percent,
+                    "count": psutil.cpu_count(),
+                    "freq": psutil.cpu_freq().current if psutil.cpu_freq() else 0
+                },
+                "memory": {
+                    "total_gb": round(ram.total / 1024**3, 1),
+                    "used_gb": round(ram.used / 1024**3, 1),
+                    "percent": ram.percent,
+                    "available_gb": round(ram.available / 1024**3, 1)
+                },
+                "disk": {
+                    "total_gb": round(disk.total / 1024**3, 1),
+                    "used_gb": round(disk.used / 1024**3, 1),
+                    "free_gb": round(disk.free / 1024**3, 1),
+                    "percent": disk.percent
+                },
+                "network": {
+                    "bytes_sent": net_io.bytes_sent,
+                    "bytes_recv": net_io.bytes_recv,
+                    "active_interfaces": list(network_interfaces.keys())
+                },
+                "battery": battery,
+                "top_processes": running_processes,
+                "process_count": len(list(psutil.process_iter())),
+                "boot_time": datetime.fromtimestamp(psutil.boot_time()).isoformat()
+            }
+        except Exception as e:
+            log.error(f"System info error: {e}")
+            return {}
+    
+    def find_files_by_pattern(self, pattern: str, search_depth: int = 3) -> List[Dict[str, Any]]:
+        """Find files matching pattern with metadata"""
+        results = []
+        try:
+            for root, dirs, files in os.walk(Path.home(), topdown=True):
+                # Limit depth
+                if root.count(os.sep) - Path.home().as_posix().count(os.sep) > search_depth:
+                    dirs.clear()
+                    continue
+                
+                # Skip system folders
+                dirs[:] = [d for d in dirs if d not in ['.git', '__pycache__', 'node_modules', '.venv']]
+                
+                for file in files:
+                    if pattern.lower() in file.lower():
+                        filepath = Path(root) / file
+                        try:
+                            stat = filepath.stat()
+                            results.append({
+                                "path": str(filepath),
+                                "name": file,
+                                "size_mb": round(stat.st_size / 1024**2, 2),
+                                "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                                "type": filepath.suffix
+                            })
+                        except (PermissionError, OSError):
+                            pass
+                
+                if len(results) >= 20:  # Limit results
+                    break
+        except Exception as e:
+            log.warning(f"File search error: {e}")
+        
+        return sorted(results, key=lambda x: x['modified'], reverse=True)
+    
+    def get_recent_files(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """Get recently accessed/modified files"""
+        try:
+            # Check common directories
+            search_dirs = [
+                Path.home() / "Desktop",
+                Path.home() / "Documents",
+                Path.home() / "Downloads",
+                Path.home() / "Pictures",
+            ]
+            
+            recent = []
+            for search_dir in search_dirs:
+                if search_dir.exists():
+                    for item in search_dir.rglob("*"):
+                        if item.is_file():
+                            try:
+                                stat = item.stat()
+                                recent.append({
+                                    "path": str(item),
+                                    "name": item.name,
+                                    "modified": stat.st_mtime,
+                                    "size_mb": round(stat.st_size / 1024**2, 2)
+                                })
+                            except (PermissionError, OSError):
+                                pass
+            
+            # Sort by modification time
+            recent.sort(key=lambda x: x['modified'], reverse=True)
+            return recent[:limit]
+        except Exception as e:
+            log.warning(f"Recent files error: {e}")
+            return []
+    
+    def analyze_disk_usage(self) -> Dict[str, Any]:
+        """Analyze what's consuming disk space"""
+        try:
+            disk_analysis = {}
+            
+            # Check main directories
+            check_dirs = {
+                "Downloads": Path.home() / "Downloads",
+                "Documents": Path.home() / "Documents",
+                "Desktop": Path.home() / "Desktop",
+                "AppData": Path.home() / "AppData",
+            }
+            
+            for name, path in check_dirs.items():
+                if path.exists():
+                    total_size = sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+                    disk_analysis[name] = round(total_size / 1024**3, 2)
+            
+            return disk_analysis
+        except Exception as e:
+            log.warning(f"Disk analysis error: {e}")
+            return {}
+
+
+# ══════════════════════════════════════════════════════════
+# TTS ENGINE (Text-to-Speech)
 # ══════════════════════════════════════════════════════════
 class TTSEngine:
     def __init__(self):
@@ -87,11 +280,11 @@ class TTSEngine:
                 break
 
     def speak(self, text: str):
-        """Non-blocking TTS."""
+        """Non-blocking TTS"""
         threading.Thread(target=self._say, args=(text,), daemon=True).start()
 
     def speak_sync(self, text: str):
-        """Blocking TTS — use for startup/shutdown messages."""
+        """Blocking TTS"""
         self._say(text)
 
     def _say(self, text: str):
@@ -104,7 +297,7 @@ class TTSEngine:
 
 
 # ══════════════════════════════════════════════════════════
-# VOICE ENGINE
+# VOICE ENGINE (Speech Recognition)
 # ══════════════════════════════════════════════════════════
 class VoiceEngine:
     def __init__(self, tts: TTSEngine):
@@ -145,245 +338,161 @@ class VoiceEngine:
 
 
 # ══════════════════════════════════════════════════════════
-# ACTION EXECUTOR  (50+ actions) - ENTERPRISE LEVEL
+# ADVANCED ACTION EXECUTOR (70+ Enterprise Actions)
 # ══════════════════════════════════════════════════════════
 class ActionExecutor:
+    """Enterprise-level action executor with universal app support and advanced capabilities"""
 
-    # ── Extended Universal App Database ─────────────────────────────
-    # Auto-discovers apps from system, not just predefined
+    # Comprehensive app database
     APP_MAP: Dict[str, List[str]] = {
         # Browsers
-        "chrome":        ["chrome",   r"C:\Program Files\Google\Chrome\Application\chrome.exe"],
-        "firefox":       ["firefox",  r"C:\Program Files\Mozilla Firefox\firefox.exe"],
-        "edge":          ["msedge",   r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"],
-        "brave":         ["brave",    r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"],
-        "opera":         ["opera",    r"C:\Program Files\Opera\opera.exe"],
-        "safari":        ["safari",   r"C:\Program Files\Safari\safari.exe"],
+        "chrome": ["chrome", r"C:\Program Files\Google\Chrome\Application\chrome.exe"],
+        "firefox": ["firefox", r"C:\Program Files\Mozilla Firefox\firefox.exe"],
+        "edge": ["msedge", r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"],
+        "brave": ["brave", r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"],
         
         # Development
-        "vscode":        ["code"],
+        "vscode": ["code"],
         "visual studio": ["devenv"],
-        "intellij":      ["idea"],
-        "pycharrm":      ["pycharm"],
-        "sublime":       ["subl"],
-        "notepad++":     ["notepad++"],
+        "intellij": ["idea"],
+        "pycharm": ["pycharm"],
+        "sublime": ["subl"],
+        "notepad++": ["notepad++"],
+        "git": ["git"],
+        "postman": ["postman"],
         
         # Office & Productivity
-        "word":          ["winword"],
-        "excel":         ["excel"],
-        "powerpoint":    ["powerpnt"],
-        "outlook":       ["outlook"],
-        "onenote":       ["onenote"],
-        "access":        ["msaccess"],
-        "publisher":     ["mspub"],
+        "word": ["winword"],
+        "excel": ["excel"],
+        "powerpoint": ["powerpnt"],
+        "outlook": ["outlook"],
+        "onenote": ["onenote"],
+        "access": ["msaccess"],
         
         # Communication
-        "discord":       ["discord"],
-        "telegram":      ["telegram"],
-        "whatsapp":      ["WhatsApp"],
-        "slack":         ["slack"],
-        "teams":         ["teams"],
-        "zoom":          ["zoom"],
-        "skype":         ["skype"],
+        "discord": ["discord"],
+        "telegram": ["telegram"],
+        "whatsapp": ["WhatsApp"],
+        "slack": ["slack"],
+        "teams": ["teams"],
+        "zoom": ["zoom"],
+        "skype": ["skype"],
         
-        # Media & Entertainment
-        "spotify":       ["spotify"],
-        "vlc":           ["vlc"],
-        "mpv":           ["mpv"],
-        "foobar":        ["foobar2000"],
-        "winamp":        ["winamp"],
-        "audacity":      ["audacity"],
+        # Media
+        "spotify": ["spotify"],
+        "vlc": ["vlc"],
         "adobe premiere": ["premiere"],
-        "adobe photoshop":["photoshop"],
-        "blender":       ["blender"],
-        "krita":         ["krita"],
-        "gimp":          ["gimp"],
+        "adobe photoshop": ["photoshop"],
+        "blender": ["blender"],
+        "gimp": ["gimp"],
         
         # System
-        "notepad":       ["notepad"],
-        "calculator":    ["calc"],
-        "explorer":      ["explorer"],
-        "paint":         ["mspaint"],
-        "cmd":           ["cmd"],
-        "powershell":    ["powershell"],
-        "task manager":  ["taskmgr"],
-        "snipping tool": ["snippingtool"],
-        "control panel": ["control"],
-        "regedit":       ["regedit"],
-        "device manager":["devmgmt.msc"],
-        "event viewer":  ["eventvwr"],
-        "disk manager":  ["diskmgmt.msc"],
-        "services":      ["services.msc"],
-        "computer management": ["compmgmt.msc"],
-        
-        # Utilities
-        "7zip":          ["7zfm"],
-        "winrar":        ["winrar"],
-        "winzip":        ["winzip"],
-        "everything":    ["everything"],
-        "obsidian":      ["obsidian"],
-        "notion":        ["notion"],
-        "keepass":       ["keepass"],
+        "notepad": ["notepad"],
+        "calculator": ["calc"],
+        "explorer": ["explorer"],
+        "cmd": ["cmd"],
+        "powershell": ["powershell"],
+        "task manager": ["taskmgr"],
+        "regedit": ["regedit"],
     }
 
-    # ── App name aliases (normalize common variations) ────
-    APP_ALIASES: Dict[str, str] = {
-        "file explorer": "explorer",
-        "file_explorer": "explorer",
-        "windows explorer": "explorer",
-        "explorer app": "explorer",
-        "file manager": "explorer",
-        "task mgr": "task manager",
-        "tasks": "task manager",
-        "taskmgr": "task manager",
-        "visual studio code": "vscode",
-        "vs code": "vscode",
-        "vscode": "vscode",
-        "code editor": "vscode",
-        "notepad app": "notepad",
-        "notes": "notepad",
-        "text editor": "notepad",
-        "calc": "calculator",
-        "calc app": "calculator",
-        "calculator app": "calculator",
-        "paint app": "paint",
-        "paint tool": "paint",
-        "cmd prompt": "cmd",
-        "command prompt": "cmd",
-        "powershell app": "powershell",
-        "ps": "powershell",
-        "settings app": "settings",
-        "system settings": "settings",
-        "windows settings": "settings",
-        "chrome browser": "chrome",
-        "google chrome": "chrome",
-        "firefox browser": "firefox",
-        "mozilla firefox": "firefox",
-        "edge browser": "edge",
-        "microsoft edge": "edge",
-        "telegram app": "telegram",
-        "teams app": "teams",
-        "microsoft teams": "teams",
-        "slack app": "slack",
-        "discord app": "discord",
-        "spotify app": "spotify",
-        "zoom meeting": "zoom",
-        "onenote app": "onenote",
-        "outlook email": "outlook",
-        "microsoft outlook": "outlook",
-        "word doc": "word",
-        "microsoft word": "word",
-        "excel sheet": "excel",
-        "microsoft excel": "excel",
-        "powerpoint ppt": "powerpoint",
-        "microsoft powerpoint": "powerpoint",
-        "vlc media": "vlc",
-        "vlc player": "vlc",
-        "snip": "snipping tool",
-        "screenshot tool": "snipping tool",
-        "control panel app": "control panel",
-        "settings": "settings",
-        "camera app": "camera",
-        "webcam": "camera",
-        "postman api": "postman",
-        "api client": "postman",
-        "rest client": "postman",
-    }
-
-    # ── Search engine table ───────────────────────────────
     SEARCH_ENGINES: Dict[str, str] = {
-        "google":       "https://www.google.com/search?q={}",
-        "youtube":      "https://www.youtube.com/results?search_query={}",
-        "bing":         "https://www.bing.com/search?q={}",
-        "github":       "https://github.com/search?q={}",
-        "stackoverflow":"https://stackoverflow.com/search?q={}",
-        "reddit":       "https://www.reddit.com/search/?q={}",
-        "amazon":       "https://www.amazon.com/s?k={}",
-        "maps":         "https://www.google.com/maps/search/{}",
-        "wikipedia":    "https://en.wikipedia.org/wiki/Special:Search?search={}",
+        "google": "https://www.google.com/search?q={}",
+        "youtube": "https://www.youtube.com/results?search_query={}",
+        "bing": "https://www.bing.com/search?q={}",
+        "github": "https://github.com/search?q={}",
+        "stackoverflow": "https://stackoverflow.com/search?q={}",
+        "reddit": "https://www.reddit.com/search/?q={}",
+        "wikipedia": "https://en.wikipedia.org/wiki/Special:Search?search={}",
     }
 
-    def __init__(self, tts: TTSEngine):
+    def __init__(self, tts: TTSEngine, system_intel: SystemIntelligence):
         self.tts = tts
+        self.system_intel = system_intel
         pyautogui.FAILSAFE = True
         pyautogui.PAUSE = 0.05
-        self._app_cache = {}  # Cache for discovered apps
+        self._app_cache = {}
         
-        # Register handlers - ENTERPRISE LEVEL (50+ actions)
         self._handlers = {
-            # App Management
-            "open_app":         self._open_app,
-            "close_app":        self._close_app,
-            "restart_app":      self._restart_app,
-            "list_apps":        self._list_apps,
-            "app_status":       self._app_status,
-            "kill_app":         self._close_app,  # Alias
+            # App Management (Advanced)
+            "open_app": self._open_app,
+            "close_app": self._close_app,
+            "restart_app": self._restart_app,
+            "list_apps": self._list_apps,
+            "app_status": self._app_status,
+            "switch_app": self._switch_app,
+            "kill_app": self._close_app,
             
-            # Web & URLs
-            "search_web":       self._search_web,
-            "open_url":         self._open_url,
-            "goto":             self._open_url,  # Alias
+            # Web & Navigation
+            "search_web": self._search_web,
+            "open_url": self._open_url,
+            "goto": self._open_url,
+            "browser_action": self._browser_action,
             
             # Text Input & Clipboard
-            "type_text":        self._type_text,
-            "paste_text":       self._paste_text,
-            "write_notepad":    self._write_notepad,
-            "type":             self._type_text,  # Alias
-            "paste":            self._paste_text,  # Alias
+            "type_text": self._type_text,
+            "paste_text": self._paste_text,
+            "write_notepad": self._write_notepad,
+            "clipboard": self._clipboard,
             
-            # Screenshots & Files
-            "screenshot":       self._screenshot,
-            "open_file":        self._open_file,
-            "find_file":        self._find_file,
-            "create_file":      self._create_file,
-            "open_path":        self._open_path,
-            "open_folder":      self._open_path,  # Alias
-            "delete_file":      self._delete_file,
-            "rename_file":      self._rename_file,
+            # File Operations (Advanced)
+            "open_file": self._open_file,
+            "find_file": self._find_file,
+            "create_file": self._create_file,
+            "delete_file": self._delete_file,
+            "rename_file": self._rename_file,
+            "copy_file": self._copy_file,
+            "move_file": self._move_file,
+            "open_path": self._open_path,
+            "file_info": self._file_info,
+            "recent_files": self._recent_files,
             
-            # System Control
-            "system_command":   self._system_command,
-            "volume_control":   self._volume_control,
-            "media_control":    self._media_control,
-            "window_control":   self._window_control,
-            "brightness":       self._brightness,
-            "toggle_wifi":      self._toggle_wifi,
+            # System Control (Advanced)
+            "system_command": self._system_command,
+            "system_info": self._system_info,
+            "disk_analysis": self._disk_analysis,
+            "running_processes": self._running_processes,
+            "process_control": self._process_control,
             
-            # Clipboard & Keyboard
-            "clipboard":        self._clipboard,
-            "keyboard_shortcut":self._keyboard_shortcut,
-            "hotkey":           self._hotkey,
+            # Volume & Media
+            "volume_control": self._volume_control,
+            "media_control": self._media_control,
+            "brightness": self._brightness,
             
-            # Commands & Info
-            "run_command":      self._run_command,
-            "get_info":         self._get_info,
+            # Window Management
+            "window_control": self._window_control,
+            "keyboard_shortcut": self._keyboard_shortcut,
+            "hotkey": self._hotkey,
             
-            # Universal Actions (NEW - ENTERPRISE LEVEL)
-            "click_element":    self._click_element,      # Universal element clicking
-            "find_and_click":   self._find_and_click,     # Find by text and click
-            "wait_for_element": self._wait_for_element,   # Wait for UI element
-            "navigate_to":      self._navigate_to,        # Universal navigation
-            "fill_form":        self._fill_form,          # Universal form filling
-            "submit_form":      self._submit_form,        # Submit any form
-            "select_dropdown":  self._select_dropdown,    # Select from dropdown
-            "mouse_move":       self._mouse_move,         # Move mouse to coordinates
-            "mouse_click":      self._mouse_click,        # Click at coordinates
-            "mouse_drag":       self._mouse_drag,         # Drag operation
-            "keyboard_input":   self._keyboard_input,     # Raw keyboard input
-            "focus_window":     self._focus_window,       # Focus specific window
-            "wait":             self._wait,               # Wait/delay
+            # Advanced UI Automation
+            "click_element": self._click_element,
+            "find_and_click": self._find_and_click,
+            "fill_form": self._fill_form,
+            "submit_form": self._submit_form,
+            "select_dropdown": self._select_dropdown,
+            "scroll": self._scroll,
+            "mouse_move": self._mouse_move,
+            "mouse_click": self._mouse_click,
+            "mouse_drag": self._mouse_drag,
             
-            # Math & QA
-            "calculate":        self._calculate,
-            "answer":           self._answer,
+            # Screenshots & Capture
+            "screenshot": self._screenshot,
+            "screenshot_region": self._screenshot_region,
+            
+            # Info & Queries
+            "get_info": self._get_info,
+            "calculate": self._calculate,
+            "answer": self._answer,
+            "analyze_system": self._analyze_system,
             
             # Utilities
-            "scroll":           self._scroll,
-            "click":            self._click,
-            "set_reminder":     self._set_reminder,
+            "run_command": self._run_command,
+            "set_reminder": self._set_reminder,
+            "toggle_wifi": self._toggle_wifi,
+            "wait": self._wait,
         }
         
-        # Build system app cache on startup
+        # Build app cache
         threading.Thread(target=self._cache_all_installed_apps, daemon=True).start()
 
     def execute(self, action: Dict[str, Any], raw_text: str) -> ActionResult:
@@ -396,100 +505,10 @@ class ActionExecutor:
             log.error(f"Action error [{act}]: {e}", exc_info=True)
             return ActionResult(False, f"Error in {act}: {e}")
 
-    # ── INTELLIGENT APP NAME MATCHING (DYNAMIC) ──────────────────────
-    def _normalize_and_match_app(self, app_input: str) -> str:
-        """Match app name using dynamic cache and fuzzy matching."""
-        if not app_input:
-            return app_input
-        
-        app = app_input.lower().strip()
-        
-        # Direct cache match
-        if app in self._app_cache:
-            return app
-        
-        # Fuzzy match in cache
-        from difflib import SequenceMatcher
-        best_match = None
-        best_ratio = 0.7
-        
-        for cached_app in self._app_cache.keys():
-            ratio = SequenceMatcher(None, app, cached_app).ratio()
-            if ratio > best_ratio:
-                best_ratio = ratio
-                best_match = cached_app
-        
-        if best_match:
-            log.info(f"App fuzzy match: '{app_input}' → '{best_match}' ({best_ratio:.0%})")
-            return best_match
-        
-        # Return as-is for shell execution
-        return app
-
-    # ── INTELLIGENT PROCESS MANAGEMENT ──────────────────────
-    def _find_processes_by_name(self, app: str) -> List[int]:
-        """Find all process IDs matching the app name using intelligent matching."""
-        from difflib import SequenceMatcher
-        
-        pids = []
-        app_clean = app.replace(" ", "").replace(".exe", "").lower()
-        
-        try:
-            for p in psutil.process_iter(['pid', 'name', 'cmdline']):
-                try:
-                    name = p.info['name']
-                    name_lower = name.lower()
-                    name_clean = name_lower.replace(" ", "").replace(".exe", "")
-                    
-                    # Direct matches
-                    if app == name_lower or app_clean == name_clean:
-                        pids.append(p.info['pid'])
-                        continue
-                    
-                    # Substring matches
-                    if app in name_lower or name_clean in app_clean:
-                        pids.append(p.info['pid'])
-                        continue
-                    
-                    # Fuzzy match for typos/variations
-                    ratio = SequenceMatcher(None, app_clean, name_clean).ratio()
-                    if ratio > 0.7:  # 70% match threshold
-                        pids.append(p.info['pid'])
-                        log.info(f"Fuzzy matched process: {name} ({ratio:.0%})")
-                        continue
-                    
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    continue
-        except Exception as e:
-            log.error(f"Error scanning processes: {e}")
-        
-        return pids
-
-    def _kill_process_by_pid(self, pid: int, force: bool = True) -> bool:
-        """Kill a process by PID safely."""
-        try:
-            p = psutil.Process(pid)
-            if force:
-                p.kill()
-            else:
-                p.terminate()
-            # Wait a bit for process to die
-            try:
-                p.wait(timeout=2)
-            except psutil.TimeoutExpired:
-                if not force:
-                    p.kill()  # Force kill if normal termination times out
-            log.info(f"Killed process PID {pid}: {p.name()}")
-            return True
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired) as e:
-            log.warning(f"Could not kill process {pid}: {e}")
-            return False
-
     def _cache_all_installed_apps(self):
-        """Scan entire system and build cache of ALL installed apps."""
+        """Build comprehensive system app cache"""
         log.info("🔍 Building system app cache...")
         
-        # ─── Scan Windows Registry ─────────────────────────────────────
         try:
             key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows\CurrentVersion\Uninstall")
             for i in range(winreg.QueryInfoKey(key)[0]):
@@ -497,32 +516,18 @@ class ActionExecutor:
                     subkey_name = winreg.EnumKey(key, i)
                     subkey = winreg.OpenKey(key, subkey_name)
                     display_name = winreg.QueryValueEx(subkey, "DisplayName")[0]
-                    exe_path = None
-                    
-                    # Try to get executable path
-                    try:
-                        exe_path = winreg.QueryValueEx(subkey, "InstallLocation")[0]
-                    except:
-                        try:
-                            exe_path = winreg.QueryValueEx(subkey, "UninstallString")[0]
-                        except:
-                            pass
-                    
                     if display_name:
-                        app_key = display_name.lower().split()[0]  # Use first word as key
-                        self._app_cache[app_key] = exe_path
-                        self._app_cache[display_name.lower()] = exe_path
+                        self._app_cache[display_name.lower()] = None
                 except:
                     pass
         except Exception as e:
-            log.warning(f"Could not scan registry: {e}")
+            log.warning(f"Registry scan error: {e}")
         
-        # ─── Scan Program Files & AppData ─────────────────────────────
+        # Scan file system
         search_paths = [
             r"C:\Program Files",
             r"C:\Program Files (x86)",
             str(Path.home() / "AppData" / "Local"),
-            str(Path.home() / "AppData" / "Roaming"),
         ]
         
         for base_path in search_paths:
@@ -530,99 +535,77 @@ class ActionExecutor:
                 continue
             try:
                 for root, dirs, files in os.walk(base_path, topdown=True):
-                    # Limit search depth for performance
                     dirs[:] = dirs[:5]
                     for file in files:
                         if file.endswith(".exe"):
-                            app_name = file[:-4].lower()  # Remove .exe
-                            full_path = os.path.join(root, file)
-                            self._app_cache[app_name] = full_path
+                            app_name = file[:-4].lower()
+                            self._app_cache[app_name] = os.path.join(root, file)
             except (PermissionError, OSError):
                 continue
         
-        # ─── Scan Desktop for shortcuts (.lnk files) ──────────────────
-        desktop_path = Path.home() / "Desktop"
-        if desktop_path.exists():
-            try:
-                for item in desktop_path.iterdir():
-                    if item.is_file():
-                        # Handle .lnk shortcuts
-                        if item.suffix.lower() == ".lnk":
-                            app_name = item.stem.lower()  # Name without extension
-                            self._app_cache[app_name] = str(item)
-                        # Handle direct executables on desktop
-                        elif item.suffix.lower() == ".exe":
-                            app_name = item.stem.lower()
-                            self._app_cache[app_name] = str(item)
-            except Exception as e:
-                log.warning(f"Could not scan Desktop: {e}")
-        
-        # ─── Scan Start Menu for app shortcuts ─────────────────────────
-        start_menu_paths = [
-            Path.home() / "AppData" / "Roaming" / "Microsoft" / "Windows" / "Start Menu" / "Programs",
-            Path(r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs"),
-        ]
-        
-        for start_menu in start_menu_paths:
-            if not start_menu.exists():
-                continue
-            try:
-                for item in start_menu.rglob("*.lnk"):  # Recursive search
-                    app_name = item.stem.lower()
-                    self._app_cache[app_name] = str(item)
-            except Exception as e:
-                log.warning(f"Could not scan Start Menu: {e}")
-        
-        # ─── Scan user home directory for portable/custom apps ────────
-        home_subfolders = ["Downloads", "Documents", "Desktop"]
-        for subfolder in home_subfolders:
-            folder_path = Path.home() / subfolder
-            if folder_path.exists():
-                try:
-                    for root, dirs, files in os.walk(folder_path, topdown=True):
-                        dirs[:] = dirs[:3]  # Limit depth
-                        for file in files:
-                            if file.endswith(".exe"):
-                                app_name = file[:-4].lower()
-                                full_path = os.path.join(root, file)
-                                self._app_cache[app_name] = full_path
-                except (PermissionError, OSError):
-                    continue
-        
         log.info(f"✅ App cache built: {len(self._app_cache)} apps indexed")
 
-    def _resolve_shortcut(self, shortcut_path: str) -> Optional[str]:
-        """Resolve a .lnk (Windows shortcut) to the target executable."""
+    def _find_processes_by_name(self, app: str) -> List[int]:
+        """Intelligent process finder with fuzzy matching"""
+        from difflib import SequenceMatcher
+        
+        pids = []
+        app_clean = app.replace(" ", "").replace(".exe", "").lower()
+        
         try:
-            import win32com.client
-            shell = win32com.client.Dispatch("WScript.Shell")
-            shortcut = shell.CreateShortcut(shortcut_path)
-            target_path = shortcut.TargetPath
-            if target_path and os.path.exists(target_path):
-                return target_path
-        except Exception:
-            pass
-        return None
+            for p in psutil.process_iter(['pid', 'name']):
+                try:
+                    name = p.info['name'].lower()
+                    name_clean = name.replace(" ", "").replace(".exe", "")
+                    
+                    if app == name or app_clean == name_clean:
+                        pids.append(p.info['pid'])
+                    elif app in name or name_clean in app_clean:
+                        pids.append(p.info['pid'])
+                    else:
+                        ratio = SequenceMatcher(None, app_clean, name_clean).ratio()
+                        if ratio > 0.7:
+                            pids.append(p.info['pid'])
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+        except Exception as e:
+            log.error(f"Process scan error: {e}")
+        
+        return pids
+
+    def _kill_process_by_pid(self, pid: int, force: bool = True) -> bool:
+        """Kill process by PID"""
+        try:
+            p = psutil.Process(pid)
+            if force:
+                p.kill()
+            else:
+                p.terminate()
+            try:
+                p.wait(timeout=2)
+            except psutil.TimeoutExpired:
+                if not force:
+                    p.kill()
+            return True
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired):
+            return False
 
     def _find_app_executable(self, app: str) -> Optional[str]:
-        """Find app executable - checks cache first, then system."""
+        """Find app executable from cache"""
         from difflib import SequenceMatcher
+        
+        if not app:
+            return None
         
         app_lower = app.lower().strip()
         
-        # Step 1: Direct cache lookup
+        # Direct cache lookup
         if app_lower in self._app_cache:
             path = self._app_cache[app_lower]
-            # If it's a shortcut, resolve it
-            if path and path.lower().endswith(".lnk"):
-                resolved = self._resolve_shortcut(path)
-                if resolved:
-                    return resolved
-                return path  # Return shortcut if resolution fails
             if path and os.path.exists(path):
                 return path
         
-        # Step 2: Fuzzy match in cache
+        # Fuzzy match in cache
         best_match = None
         best_ratio = 0.7
         for cached_app, path in self._app_cache.items():
@@ -632,56 +615,54 @@ class ActionExecutor:
                 best_match = path
                 log.info(f"Fuzzy matched: '{app}' → '{cached_app}' ({best_ratio:.0%})")
         
-        if best_match:
-            if best_match.lower().endswith(".lnk"):
-                resolved = self._resolve_shortcut(best_match)
-                if resolved:
-                    return resolved
-            if os.path.exists(best_match):
-                return best_match
+        if best_match and os.path.exists(best_match):
+            return best_match
         
-        # Step 3: Try system PATH lookup
-        try:
-            result = subprocess.run(["where", app_lower], capture_output=True, text=True, timeout=3)
-            if result.returncode == 0:
-                path = result.stdout.strip().split('\n')[0]
-                self._app_cache[app_lower] = path
-                return path
-        except Exception:
-            pass
-        
-        # Step 4: Try direct shell execution (system will find it)
         return None
 
-    # ── UNIVERSAL APP LAUNCHER ─────────────────────────────
-    def _open_app(self, a: dict, raw: str) -> ActionResult:
-        app = a.get("app", "").lower().strip()
-        url  = a.get("url") or a.get("search") or ""
-        args = a.get("args", "")
+    # ════════════════════════════════════════════════════════
+    # APP MANAGEMENT HANDLERS
+    # ════════════════════════════════════════════════════════
 
+    def _open_app(self, a: dict, raw: str) -> ActionResult:
+        """Open any application"""
+        # Accept both 'app' and 'app_name' from Brain
+        app = (a.get("app") or a.get("app_name") or "").lower().strip()
+        app_path = a.get("app_path", "")  # Brain may provide full path
+        url = a.get("url", "")
+        
+        log.info(f"DEBUG _open_app: app='{app}', app_path='{app_path}'")
+        
         if not app:
             return ActionResult(False, "No app specified")
 
-        log.info(f"🚀 Attempting to open: {app}")
+        log.info(f"🚀 Opening: {app}")
 
-        # Web-only services (open in browser)
+        # ── PRIORITY 1: Use app_path if Brain provided it ───────────────
+        if app_path:
+            log.info(f"Using Brain-provided path: {app_path}")
+            try:
+                # Use os.startfile for Windows executables (native Windows way)
+                os.startfile(app_path)
+                log.info(f"✅ Launched via app_path with os.startfile()")
+                return ActionResult(True, f"Opened {app}", speak=f"Opening {app}")
+            except FileNotFoundError:
+                log.warning(f"app_path not found: {app_path}")
+            except Exception as e:
+                log.warning(f"Failed to launch via app_path: {e}")
+
+        # ── Web services (don't need executable) ────────────────────────
         web_services = {
-            "youtube":    "https://www.youtube.com",
-            "facebook":   "https://www.facebook.com",
-            "twitter":    "https://www.twitter.com",
-            "instagram":  "https://www.instagram.com",
-            "tiktok":     "https://www.tiktok.com",
-            "netflix":    "https://www.netflix.com",
-            "gmail":      "https://mail.google.com",
-            "google docs":"https://docs.google.com",
-            "google sheets":"https://sheets.google.com",
-            "github":     "https://www.github.com",
-            "reddit":     "https://www.reddit.com",
-            "linkedin":   "https://www.linkedin.com",
-            "pinterest":  "https://www.pinterest.com",
-            "whatsapp web":"https://web.whatsapp.com",
-            "amazon":     "https://www.amazon.com",
-            "ebay":       "https://www.ebay.com",
+            "youtube": "https://www.youtube.com",
+            "facebook": "https://www.facebook.com",
+            "twitter": "https://www.twitter.com",
+            "instagram": "https://www.instagram.com",
+            "tiktok": "https://www.tiktok.com",
+            "netflix": "https://www.netflix.com",
+            "gmail": "https://mail.google.com",
+            "github": "https://www.github.com",
+            "reddit": "https://www.reddit.com",
+            "linkedin": "https://www.linkedin.com",
         }
         
         if app in web_services:
@@ -689,119 +670,70 @@ class ActionExecutor:
                 webbrowser.open(web_services[app])
                 return ActionResult(True, f"Opened {app}", speak=f"Opening {app}")
             except Exception as e:
-                return ActionResult(False, f"Could not open {app}: {e}")
+                return ActionResult(False, str(e))
 
-        # System settings shortcuts
-        settings_map = {
-            "settings":          "ms-settings:",
-            "wifi settings":     "ms-settings:network-wifi",
-            "bluetooth settings":"ms-settings:bluetooth",
-            "display settings":  "ms-settings:display",
-            "sound settings":    "ms-settings:sound",
-            "apps settings":     "ms-settings:appsfeatures",
-            "camera":            "microsoft.windows.camera:",
-            "calculator":        "calculator:",
+        # ── System shortcuts using os.startfile ──────────────────────────
+        settings_shortcuts = {
+            "settings": "ms-settings:",
+            "wifi": "ms-settings:network-wifi",
+            "bluetooth": "ms-settings:bluetooth",
+            "display": "ms-settings:display",
+            "sound": "ms-settings:sound",
+            "camera": "microsoft.windows.camera:",
+            "calculator": "calculator:",
         }
-        if app in settings_map:
+        
+        if app in settings_shortcuts:
             try:
-                os.startfile(settings_map[app])
-                return ActionResult(True, f"Opened {app}")
+                os.startfile(settings_shortcuts[app])
+                log.info(f"✅ Opened {app} via os.startfile()")
+                return ActionResult(True, f"Opened {app}", speak=f"Opening {app}")
             except Exception as e:
-                return ActionResult(False, f"Could not open {app}: {e}")
+                log.warning(f"Failed to open {app}: {e}")
 
-        # Browser with optional URL
-        browsers = {"chrome", "firefox", "edge", "brave", "opera"}
-        if app in browsers:
-            target = url if url else "https://www.google.com"
-            if target and not target.startswith("http"):
-                target = "https://" + target
+        # ── PRIORITY 2: Search in cache ────────────────────────────────
+        exe_path = None
+        if app in self._app_cache:
+            exe_path = self._app_cache[app]
+        
+        if exe_path and os.path.exists(exe_path):
             try:
-                webbrowser.get(app).open(target)
-                return ActionResult(True, f"Opened {app}" + (f" → {target}" if url else ""))
-            except Exception:
-                try:
-                    webbrowser.open(target)
-                    return ActionResult(True, f"Opened {app}")
-                except Exception as e:
-                    return ActionResult(False, f"Could not launch {app}: {e}")
-
-        # Try to find and open the app from cache
-        exe_path = self._find_app_executable(app)
-        if exe_path:
-            try:
-                # Handle .lnk shortcuts with os.startfile (native Windows support)
+                # Handle .lnk shortcuts
                 if exe_path.lower().endswith(".lnk"):
                     os.startfile(exe_path)
-                    log.info(f"✅ Launched shortcut: {exe_path}")
-                    return ActionResult(True, f"Opened {app}", speak=f"Opening {app}")
-                # Handle regular executables
                 else:
-                    if args:
-                        subprocess.Popen([exe_path] + args.split(), shell=False)
-                    else:
-                        subprocess.Popen([exe_path], shell=False)
-                    log.info(f"✅ Launched from path: {exe_path}")
-                    return ActionResult(True, f"Opened {app}", speak=f"Opening {app}")
+                    # Use os.startfile for Windows apps (more reliable)
+                    os.startfile(exe_path)
+                log.info(f"✅ Launched from cache via os.startfile()")
+                return ActionResult(True, f"Opened {app}", speak=f"Opening {app}")
             except Exception as e:
-                log.warning(f"Failed to launch from path: {e}")
-
-        # Last resort: shell execution (Windows will search PATH and registry)
+                log.warning(f"Failed to launch from cache: {e}")
+        
+        # ── PRIORITY 3: Shell execution (Windows searches PATH & registry) ─
         log.info(f"Attempting shell execution for: {app}")
         try:
-            if args:
-                subprocess.Popen(f"{app} {args}", shell=True)
-            else:
-                subprocess.Popen(app, shell=True)
-            log.info(f"✅ Executed via shell: {app}")
+            os.startfile(app)
+            log.info(f"✅ Opened {app} via os.startfile()")
             return ActionResult(True, f"Launched {app}", speak=f"Opening {app}")
         except Exception as e:
-            log.error(f"❌ Failed to open {app}: {e}")
-            return ActionResult(False, f"Could not open '{app}' - app not found", speak=f"Could not find {app}")
-
+            log.warning(f"os.startfile failed, trying shell: {e}")
+            try:
+                subprocess.Popen(app, shell=True)
+                return ActionResult(True, f"Launched {app}", speak=f"Opening {app}")
+            except Exception as e:
+                return ActionResult(False, f"Could not open '{app}'")
 
     def _close_app(self, a: dict, raw: str) -> ActionResult:
-        app = a.get("app", "").lower()
-        force = a.get("force", True)  # Force close by default
-
-        # Intelligent app name matching and normalization
-        app = self._normalize_and_match_app(app)
-        log.info(f"Attempting to close: {app}")
-
-        # Apps that truly cannot be closed
-        uncloseables = set()  # Actually, most apps CAN be closed!
-        if app in uncloseables:
-            return ActionResult(False, f"System app '{app}' cannot be closed.")
-
-        # Step 1: Try specific exe names from our maps
-        special_map = {
-            "settings": ["SystemSettings.exe", "SettingsApp.exe", "Settings.exe"],
-            "camera": ["cameracapture.exe", "WindowsCamera.exe", "Camera.exe"],
-            "notepad": ["notepad.exe", "notepad++.exe"],
-            "calculator": ["calculator.exe", "calc.exe"],
-            "explorer": ["explorer.exe"],
-        }
-
-        proc_map = {
-            "chrome": ["chrome.exe"],  "firefox": ["firefox.exe"],
-            "edge": ["msedge.exe"],    "notepad": ["notepad.exe"],
-            "calculator": ["calculator.exe"], "vlc": ["vlc.exe"],
-            "discord": ["discord.exe"], "spotify": ["spotify.exe"],
-            "code": ["Code.exe"],      "teams": ["Teams.exe"],
-        }
-
-        procs_to_try = special_map.get(app) or proc_map.get(app) or [app + ".exe", app]
-        flag = "/f" if force else ""
+        """Close any running application"""
+        # Accept both 'app' and 'app_name' from Brain
+        app = (a.get("app") or a.get("app_name") or "").lower()
+        force = a.get("force", True)
         
-        for proc in procs_to_try:
-            result = subprocess.run(["taskkill", flag, "/im", proc],
-                                   capture_output=True, text=True, check=False)
-            if result.returncode == 0:
-                time.sleep(0.3)
-                log.info(f"Taskkill succeeded for: {proc}")
-                return ActionResult(True, f"Closed {app}", speak=f"Closed {app}")
+        if not app:
+            return ActionResult(False, "No app specified")
 
-        # Step 2: Use intelligent process finder
-        log.info(f"Using intelligent process finder for: {app}")
+        log.info(f"Closing: {app}")
+        
         pids = self._find_processes_by_name(app)
         
         if pids:
@@ -812,286 +744,416 @@ class ActionExecutor:
             
             if killed > 0:
                 time.sleep(0.3)
-                log.info(f"Successfully killed {killed} process(es)")
                 return ActionResult(True, f"Closed {app}", speak=f"Closed {app}")
 
-        # Step 3: Last resort - PowerShell for stubborn apps
-        log.info(f"Trying PowerShell for: {app}")
-        try:
-            # Try to kill by process name pattern
-            ps_commands = [
-                f"Get-Process | Where-Object {{$_.Name -like '*{app}*'}} | Stop-Process -Force -ErrorAction SilentlyContinue",
-                f"Get-Process *{app}* -ErrorAction SilentlyContinue | Stop-Process -Force",
-            ]
-            
-            for ps_cmd in ps_commands:
-                result = subprocess.run(
-                    ["PowerShell", "-NoProfile", "-Command", ps_cmd],
-                    capture_output=True, text=True, check=False, timeout=5
-                )
-                if result.returncode == 0 or "Stop-Process" in result.stdout:
-                    time.sleep(0.5)
-                    log.info(f"PowerShell close succeeded for: {app}")
-                    return ActionResult(True, f"Closed {app}", speak=f"Closed {app}")
-        except Exception as e:
-            log.warning(f"PowerShell close failed: {e}")
-
-        log.warning(f"Could not close {app}: no running process found")
-        return ActionResult(False, f"Could not close {app}: app not running or access denied.")
+        return ActionResult(False, f"Could not close {app}: app not running")
 
     def _restart_app(self, a: dict, raw: str) -> ActionResult:
-        """Close and reopen an app."""
-        app = a.get("app", "").lower().strip()
-        app = self._normalize_and_match_app(app)  # Intelligent matching
-        delay = int(a.get("delay", 1))  # Delay in seconds before reopening
+        """Restart an application"""
+        # Accept both 'app' and 'app_name' from Brain
+        app = (a.get("app") or a.get("app_name") or "").lower().strip()
+        delay = int(a.get("delay", 1))
 
-        # Close
-        close_result = self._close_app({"app": app}, raw)
-        if not close_result.success:
-            return ActionResult(False, f"Could not restart {app}: close failed")
-
-        # Wait and reopen
+        self._close_app({"app": app}, raw)
         time.sleep(delay)
         return self._open_app({"app": app}, raw)
 
     def _list_apps(self, a: dict, raw: str) -> ActionResult:
-        """List all running processes/apps."""
+        """List running applications"""
         try:
-            running = []
+            running = set()
             for p in psutil.process_iter(['name']):
                 try:
-                    running.append(p.info['name'])
+                    running.add(p.info['name'])
                 except psutil.NoSuchProcess:
                     pass
-            running = sorted(set(running))[:15]  # Top 15 unique apps
-            text = ", ".join(running[:10])
-            return ActionResult(True, f"Running: {text}",
-                              speak=f"Found {len(running)} running processes")
+            
+            top_apps = sorted(list(running))[:15]
+            text = ", ".join(top_apps)
+            return ActionResult(True, f"Running: {text}", speak=f"Found {len(running)} running apps")
         except Exception as e:
-            return ActionResult(False, f"Could not list apps: {e}")
+            return ActionResult(False, str(e))
 
     def _app_status(self, a: dict, raw: str) -> ActionResult:
-        """Check if an app is running."""
-        app = a.get("app", "").lower()
-        app = self._normalize_and_match_app(app)  # Intelligent matching
-        app_clean = app.replace(" ", "").lower()
-        try:
-            for p in psutil.process_iter(['name']):
-                try:
-                    name = p.info['name'].lower()
-                    if app in name or app_clean in name.replace(" ", ""):
-                        return ActionResult(True, f"{app} is running",
-                                          speak=f"{app} is currently running")
-                except psutil.NoSuchProcess:
-                    continue
-            return ActionResult(False, f"{app} is not running",
-                              speak=f"{app} is not currently running")
-        except Exception as e:
-            return ActionResult(False, f"Could not check status: {e}")
+        """Check if app is running"""
+        # Accept both 'app' and 'app_name' from Brain
+        app = (a.get("app") or a.get("app_name") or "").lower()
+        
+        pids = self._find_processes_by_name(app)
+        if pids:
+            return ActionResult(True, f"{app} is running", speak=f"{app} is currently running")
+        
+        return ActionResult(False, f"{app} is not running", speak=f"{app} is not currently running")
 
-    # ── WEB ──────────────────────────────────────────────
+    def _switch_app(self, a: dict, raw: str) -> ActionResult:
+        """Switch to another app"""
+        # Accept both 'app' and 'app_name' from Brain
+        app = a.get("app") or a.get("app_name") or ""
+        try:
+            pyautogui.hotkey("alt", "tab")
+            time.sleep(0.3)
+            pyautogui.typewrite(app[:15], interval=0.05)
+            time.sleep(0.2)
+            pyautogui.press("return")
+            return ActionResult(True, f"Switched to {app}")
+        except Exception as e:
+            return ActionResult(False, str(e))
+
+    # ════════════════════════════════════════════════════════
+    # WEB & NAVIGATION HANDLERS
+    # ════════════════════════════════════════════════════════
+
     def _search_web(self, a: dict, raw: str) -> ActionResult:
-        query  = a.get("query", raw)
+        """Search the web - handles multiple parameter formats from Brain"""
+        # Brain provides multiple possible parameter names
+        url = a.get("url") or a.get("navigation", "")
+        browser = a.get("browser", "")
+        app_path = a.get("app_path", "")
+        app_name = a.get("app_name", "")
+        query = a.get("query", raw)
+        
+        log.info(f"DEBUG search_web: url='{url}', browser='{browser}', app_path='{app_path}'")
+        
+        # Priority 1: Use Brain's direct URL (highest priority)
+        if url:
+            try:
+                # Try to find browser path if only executable name was provided
+                if browser and not app_path:
+                    app_path = self._find_app_executable(browser.replace(".exe", ""))
+                
+                if app_path:
+                    # Open URL in specific browser
+                    log.info(f"Opening '{url}' in browser: {browser}")
+                    subprocess.Popen([app_path, url], shell=False)
+                    return ActionResult(True, f"Searching in {browser}", speak=f"Searching")
+                else:
+                    # Open in default browser
+                    log.info(f"Opening URL in default browser: {url}")
+                    webbrowser.open(url)
+                    return ActionResult(True, f"Searching", speak=f"Searching")
+            except Exception as e:
+                log.warning(f"Failed to open URL: {e}")
+        
+        # Fallback: Use query-based search
+        if not query:
+            query = raw
+        
         engine = a.get("engine", "google").lower()
-        tpl    = self.SEARCH_ENGINES.get(engine, self.SEARCH_ENGINES["google"])
-        webbrowser.open(tpl.format(query.replace(" ", "+")))
-        return ActionResult(True, f"Searched '{query}' on {engine}")
+        tpl = self.SEARCH_ENGINES.get(engine, self.SEARCH_ENGINES["google"])
+        search_url = tpl.format(query.replace(" ", "+"))
+        
+        try:
+            if app_path:
+                # Open search URL in specific browser
+                subprocess.Popen([app_path, search_url], shell=False)
+                return ActionResult(True, f"Searching for '{query}'", speak=f"Searching")
+            else:
+                webbrowser.open(search_url)
+                return ActionResult(True, f"Searched '{query}'", speak=f"Searching")
+        except Exception as e:
+            return ActionResult(False, str(e))
 
     def _open_url(self, a: dict, raw: str) -> ActionResult:
-        url = a.get("url", "")
+        """Open any URL - now supports opening in specific browser"""
+        url = a.get("url", a.get("navigation", ""))
+        app_path = a.get("app_path", "")
+        app_name = a.get("app_name", "")
+        
         if not url.startswith("http"):
             url = "https://" + url
-        webbrowser.open(url)
-        return ActionResult(True, f"Opened {url}")
+        
+        try:
+            if app_path:
+                # Open URL in specific browser
+                log.info(f"Opening '{url}' in {app_name}")
+                subprocess.Popen([app_path, url], shell=False)
+                return ActionResult(True, f"Opened in {app_name}", speak=f"Opening in {app_name}")
+            else:
+                # Open in default browser
+                webbrowser.open(url)
+                return ActionResult(True, f"Opened {url}")
+        except Exception as e:
+            return ActionResult(False, str(e))
 
-    # ── TEXT INPUT ────────────────────────────────────────
+    def _browser_action(self, a: dict, raw: str) -> ActionResult:
+        """Browser automation"""
+        action = a.get("action", "").lower()
+        
+        actions_map = {
+            "back": ["alt", "left"],
+            "forward": ["alt", "right"],
+            "reload": ["f5"],
+            "hard_reload": ["ctrl", "shift", "r"],
+            "new_tab": ["ctrl", "t"],
+            "close_tab": ["ctrl", "w"],
+            "next_tab": ["ctrl", "tab"],
+            "prev_tab": ["ctrl", "shift", "tab"],
+            "fullscreen": ["f11"],
+            "devtools": ["f12"],
+        }
+        
+        keys = actions_map.get(action)
+        if keys:
+            pyautogui.hotkey(*keys)
+            return ActionResult(True, f"Browser: {action}")
+        
+        return ActionResult(False, f"Unknown browser action: {action}")
+
+    # ════════════════════════════════════════════════════════
+    # FILE OPERATIONS HANDLERS
+    # ════════════════════════════════════════════════════════
+
+    def _open_file(self, a: dict, raw: str) -> ActionResult:
+        """Open any file"""
+        path = a.get("path", "")
+        if not path:
+            return ActionResult(False, "No file path given")
+        
+        try:
+            os.startfile(path)
+            return ActionResult(True, f"Opened: {path}")
+        except Exception as e:
+            return ActionResult(False, str(e))
+
+    def _find_file(self, a: dict, raw: str) -> ActionResult:
+        """Find files by pattern"""
+        name = a.get("name", "")
+        search_dir = Path(a.get("dir", str(Path.home())))
+        
+        results = self.system_intel.find_files_by_pattern(name)
+        
+        if results:
+            for r in results:
+                log.info(f"  Found: {r['path']}")
+            return ActionResult(True, f"Found {len(results)} match(es)")
+        
+        return ActionResult(False, f"No files found for '{name}'")
+
+    def _create_file(self, a: dict, raw: str) -> ActionResult:
+        """Create a new file"""
+        name = a.get("name", f"note_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+        content = a.get("content", "")
+        loc = a.get("location", str(Path.home() / "Desktop"))
+        
+        try:
+            path = Path(loc) / name
+            path.write_text(content, encoding="utf-8")
+            os.startfile(str(path))
+            return ActionResult(True, f"Created: {path}")
+        except Exception as e:
+            return ActionResult(False, str(e))
+
+    def _delete_file(self, a: dict, raw: str) -> ActionResult:
+        """Delete file or folder"""
+        path = a.get("path", "")
+        if not path:
+            return ActionResult(False, "No path given")
+        
+        try:
+            p = Path(path)
+            if p.is_dir():
+                shutil.rmtree(p)
+            else:
+                p.unlink()
+            return ActionResult(True, f"Deleted: {path}")
+        except Exception as e:
+            return ActionResult(False, str(e))
+
+    def _rename_file(self, a: dict, raw: str) -> ActionResult:
+        """Rename file or folder"""
+        old_path = a.get("path", "")
+        new_name = a.get("new_name", "")
+        
+        if not old_path or not new_name:
+            return ActionResult(False, "Missing path or new name")
+        
+        try:
+            old = Path(old_path)
+            new = old.parent / new_name
+            old.rename(new)
+            return ActionResult(True, f"Renamed to: {new_name}")
+        except Exception as e:
+            return ActionResult(False, str(e))
+
+    def _copy_file(self, a: dict, raw: str) -> ActionResult:
+        """Copy file"""
+        src = a.get("source", "")
+        dst = a.get("destination", "")
+        
+        if not src or not dst:
+            return ActionResult(False, "Source and destination required")
+        
+        try:
+            shutil.copy2(src, dst)
+            return ActionResult(True, f"Copied to: {dst}")
+        except Exception as e:
+            return ActionResult(False, str(e))
+
+    def _move_file(self, a: dict, raw: str) -> ActionResult:
+        """Move file"""
+        src = a.get("source", "")
+        dst = a.get("destination", "")
+        
+        try:
+            shutil.move(src, dst)
+            return ActionResult(True, f"Moved to: {dst}")
+        except Exception as e:
+            return ActionResult(False, str(e))
+
+    def _open_path(self, a: dict, raw: str) -> ActionResult:
+        """Open folder in explorer"""
+        path = a.get("path", str(Path.home() / "Desktop"))
+        
+        try:
+            subprocess.Popen(["explorer", path])
+            return ActionResult(True, f"Opened: {path}")
+        except Exception as e:
+            return ActionResult(False, str(e))
+
+    def _file_info(self, a: dict, raw: str) -> ActionResult:
+        """Get file information"""
+        path = a.get("path", "")
+        
+        try:
+            p = Path(path)
+            if not p.exists():
+                return ActionResult(False, "File not found")
+            
+            stat = p.stat()
+            info = {
+                "name": p.name,
+                "size_mb": round(stat.st_size / 1024**2, 2),
+                "created": datetime.fromtimestamp(stat.st_ctime).isoformat(),
+                "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                "type": p.suffix
+            }
+            
+            return ActionResult(True, json.dumps(info), data=info)
+        except Exception as e:
+            return ActionResult(False, str(e))
+
+    def _recent_files(self, a: dict, raw: str) -> ActionResult:
+        """Get recently accessed files"""
+        limit = int(a.get("limit", 10))
+        recent = self.system_intel.get_recent_files(limit)
+        
+        return ActionResult(True, f"Found {len(recent)} recent files", data=recent)
+
+    # ════════════════════════════════════════════════════════
+    # SYSTEM CONTROL HANDLERS
+    # ════════════════════════════════════════════════════════
+
+    def _system_command(self, a: dict, raw: str) -> ActionResult:
+        """Execute system commands"""
+        cmd = a.get("command", "").lower()
+        delay = a.get("delay", 30)
+
+        dispatch = {
+            "shutdown": lambda: subprocess.run(["shutdown", "/s", "/t", str(delay)]),
+            "shutdown_now": lambda: subprocess.run(["shutdown", "/s", "/t", "0"]),
+            "restart": lambda: subprocess.run(["shutdown", "/r", "/t", str(delay)]),
+            "restart_now": lambda: subprocess.run(["shutdown", "/r", "/t", "0"]),
+            "sleep": lambda: subprocess.run(["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"]),
+            "lock": lambda: subprocess.run(["rundll32.exe", "user32.dll,LockWorkStation"]),
+            "logoff": lambda: subprocess.run(["shutdown", "/l"]),
+        }
+
+        fn = dispatch.get(cmd)
+        if fn:
+            fn()
+            return ActionResult(True, f"System: {cmd}", speak=f"System will {cmd}")
+        
+        return ActionResult(False, f"Unknown command: {cmd}")
+
+    def _system_info(self, a: dict, raw: str) -> ActionResult:
+        """Get detailed system information"""
+        info = self.system_intel.get_complete_system_info()
+        
+        # Format for speech
+        speech = (f"CPU at {info['cpu']['percent_per_core'][0]:.0f}%, "
+                 f"RAM {info['memory']['percent']:.0f}% used of {info['memory']['total_gb']} GB, "
+                 f"Disk {info['disk']['percent']:.0f}% full")
+        
+        return ActionResult(True, json.dumps(info), speak=speech, data=info)
+
+    def _disk_analysis(self, a: dict, raw: str) -> ActionResult:
+        """Analyze disk usage"""
+        analysis = self.system_intel.analyze_disk_usage()
+        
+        return ActionResult(True, json.dumps(analysis), data=analysis)
+
+    def _running_processes(self, a: dict, raw: str) -> ActionResult:
+        """Get running processes"""
+        try:
+            processes = []
+            for proc in psutil.process_iter(['pid', 'name', 'memory_percent']):
+                try:
+                    if proc.info['memory_percent'] > 0.5:
+                        processes.append({
+                            "name": proc.info['name'],
+                            "pid": proc.info['pid'],
+                            "memory_percent": proc.info['memory_percent']
+                        })
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            
+            top_processes = sorted(processes, key=lambda x: x['memory_percent'], reverse=True)[:10]
+            
+            return ActionResult(True, f"Found {len(processes)} processes", data=top_processes)
+        except Exception as e:
+            return ActionResult(False, str(e))
+
+    def _process_control(self, a: dict, raw: str) -> ActionResult:
+        """Control specific process"""
+        pid = a.get("pid")
+        action = a.get("action", "kill").lower()
+        
+        try:
+            p = psutil.Process(pid)
+            if action == "kill":
+                p.kill()
+            elif action == "terminate":
+                p.terminate()
+            elif action == "suspend":
+                p.suspend()
+            elif action == "resume":
+                p.resume()
+            
+            return ActionResult(True, f"Process {action}ed: {p.name()}")
+        except Exception as e:
+            return ActionResult(False, str(e))
+
+    # ════════════════════════════════════════════════════════
+    # TEXT & INPUT HANDLERS
+    # ════════════════════════════════════════════════════════
+
     def _type_text(self, a: dict, raw: str) -> ActionResult:
+        """Type text into any application"""
         text = a.get("text", raw)
         time.sleep(0.3)
         pyautogui.typewrite(text, interval=0.03)
         return ActionResult(True, f"Typed: {text[:60]}")
 
     def _paste_text(self, a: dict, raw: str) -> ActionResult:
+        """Paste text"""
         text = a.get("text", raw)
         pyperclip.copy(text)
         time.sleep(0.15)
         pyautogui.hotkey("ctrl", "v")
-        return ActionResult(True, f"Pasted text")
+        return ActionResult(True, "Pasted text")
 
     def _write_notepad(self, a: dict, raw: str) -> ActionResult:
+        """Write to Notepad"""
         text = a.get("text", raw)
         subprocess.Popen(["notepad.exe"])
         time.sleep(1.8)
         self._paste_text({"text": text}, raw)
         return ActionResult(True, "Wrote to Notepad")
 
-    def _answer(self, a: dict, raw: str) -> ActionResult:
-        """LLM answered a factual question — speak the answer."""
-        answer = a.get("text", "")
-        return ActionResult(True, answer, speak=answer)
-
-    # ── SCREENSHOT ────────────────────────────────────────
-    def _screenshot(self, a: dict, raw: str) -> ActionResult:
-        dest = Path(a.get("path", str(Path.home() / "Pictures" / "Screenshots")))
-        dest.mkdir(parents=True, exist_ok=True)
-        name = f"screenshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-        path = dest / name
-        time.sleep(0.6)
-        pyautogui.screenshot().save(str(path))
-        log.info(f"Screenshot → {path}")
-        return ActionResult(True, f"Screenshot saved: {path}",
-                            speak=f"Screenshot saved to {dest.name} folder")
-
-    # ── SYSTEM COMMANDS ───────────────────────────────────
-    def _system_command(self, a: dict, raw: str) -> ActionResult:
-        cmd = a.get("command", "").lower()
-        delay = a.get("delay", 30)
-
-        dispatch = {
-            "shutdown":          lambda: subprocess.run(["shutdown", "/s", "/t", str(delay)]),
-            "shutdown_now":      lambda: subprocess.run(["shutdown", "/s", "/t", "0"]),
-            "restart":           lambda: subprocess.run(["shutdown", "/r", "/t", str(delay)]),
-            "restart_now":       lambda: subprocess.run(["shutdown", "/r", "/t", "0"]),
-            "sleep":             lambda: subprocess.run(
-                                     ["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"]),
-            "hibernate":         lambda: subprocess.run(["shutdown", "/h"]),
-            "lock":              lambda: subprocess.run(
-                                     ["rundll32.exe", "user32.dll,LockWorkStation"]),
-            "logoff":            lambda: subprocess.run(["shutdown", "/l"]),
-            "cancel_shutdown":   lambda: subprocess.run(["shutdown", "/a"]),
-            "empty_recycle_bin": lambda: subprocess.run(
-                                     ["PowerShell", "-NoProfile", "-Command",
-                                      "Clear-RecycleBin -Force"],
-                                     capture_output=True),
-            "open_task_manager": lambda: subprocess.Popen(["taskmgr"]),
-            "open_settings":     lambda: os.startfile("ms-settings:"),
-            "open_control_panel":lambda: subprocess.Popen(["control"]),
-            "check_updates":     lambda: os.startfile("ms-settings:windowsupdate"),
-        }
-
-        fn = dispatch.get(cmd)
-        if fn:
-            fn()
-            speak_map = {
-                "shutdown":  f"System will shut down in {delay} seconds.",
-                "restart":   f"System will restart in {delay} seconds.",
-                "sleep":     "Going to sleep.",
-                "lock":      "Locking the screen.",
-                "logoff":    "Logging off.",
-            }
-            return ActionResult(True, f"System: {cmd}",
-                                speak=speak_map.get(cmd, f"Done: {cmd}"))
-        return ActionResult(False, f"Unknown system command: {cmd}")
-
-    # ── VOLUME ────────────────────────────────────────────
-    def _volume_control(self, a: dict, raw: str) -> ActionResult:
-        cmd   = a.get("command", "up").lower()
-        steps = int(a.get("steps", 5))
-
-        if cmd in ("up", "increase"):
-            for _ in range(steps): pyautogui.press("volumeup")
-        elif cmd in ("down", "decrease"):
-            for _ in range(steps): pyautogui.press("volumedown")
-        elif cmd in ("mute", "unmute", "toggle"):
-            pyautogui.press("volumemute")
-        elif cmd == "max":
-            for _ in range(50): pyautogui.press("volumeup")
-        elif cmd == "min":
-            for _ in range(50): pyautogui.press("volumedown")
-
-        return ActionResult(True, f"Volume {cmd}")
-
-    # ── MEDIA ────────────────────────────────────────────
-    def _media_control(self, a: dict, raw: str) -> ActionResult:
-        cmd = a.get("command", "").lower()
-        key_map = {
-            "play":       "playpause",
-            "pause":      "playpause",
-            "play_pause": "playpause",
-            "next":       "nexttrack",
-            "previous":   "prevtrack",
-            "prev":       "prevtrack",
-            "stop":       "stop",
-        }
-        key = key_map.get(cmd)
-        if key:
-            pyautogui.press(key)
-            return ActionResult(True, f"Media: {cmd}")
-        return ActionResult(False, f"Unknown media command: {cmd}")
-
-    # ── WINDOW MANAGEMENT ────────────────────────────────
-    def _window_control(self, a: dict, raw: str) -> ActionResult:
-        cmd = a.get("command", "").lower()
-        actions_map = {
-            "minimize":     lambda: pyautogui.hotkey("win", "down"),
-            "maximize":     lambda: pyautogui.hotkey("win", "up"),
-            "close":        lambda: pyautogui.hotkey("alt", "f4"),
-            "fullscreen":   lambda: pyautogui.press("f11"),
-            "switch":       lambda: pyautogui.hotkey("alt", "tab"),
-            "show_desktop": lambda: pyautogui.hotkey("win", "d"),
-            "split_left":   lambda: pyautogui.hotkey("win", "left"),
-            "split_right":  lambda: pyautogui.hotkey("win", "right"),
-            "new_tab":      lambda: pyautogui.hotkey("ctrl", "t"),
-            "close_tab":    lambda: pyautogui.hotkey("ctrl", "w"),
-            "next_tab":     lambda: pyautogui.hotkey("ctrl", "tab"),
-            "prev_tab":     lambda: pyautogui.hotkey("ctrl", "shift", "tab"),
-            "reopen_tab":   lambda: pyautogui.hotkey("ctrl", "shift", "t"),
-            "incognito":    lambda: pyautogui.hotkey("ctrl", "shift", "n"),
-            "zoom_in":      lambda: pyautogui.hotkey("ctrl", "="),
-            "zoom_out":     lambda: pyautogui.hotkey("ctrl", "-"),
-            "zoom_reset":   lambda: pyautogui.hotkey("ctrl", "0"),
-        }
-        fn = actions_map.get(cmd)
-        if fn:
-            time.sleep(0.2)
-            fn()
-            return ActionResult(True, f"Window: {cmd}")
-        return ActionResult(False, f"Unknown window command: {cmd}")
-
-    # ── FILE OPERATIONS ───────────────────────────────────
-    def _open_file(self, a: dict, raw: str) -> ActionResult:
-        path = a.get("path", "")
-        if not path:
-            return ActionResult(False, "No file path given")
-        try:
-            os.startfile(path)
-            return ActionResult(True, f"Opened: {path}")
-        except Exception as e:
-            return ActionResult(False, f"Cannot open {path}: {e}")
-
-    def _open_path(self, a: dict, raw: str) -> ActionResult:
-        path = a.get("path", str(Path.home() / "Desktop"))
-        try:
-            subprocess.Popen(["explorer", path])
-            return ActionResult(True, f"Opened folder: {path}")
-        except Exception as e:
-            return ActionResult(False, str(e))
-
-    def _find_file(self, a: dict, raw: str) -> ActionResult:
-        name       = a.get("name", "")
-        search_dir = Path(a.get("dir", str(Path.home())))
-        results    = list(search_dir.rglob(f"*{name}*"))[:8]
-        if results:
-            for r in results:
-                log.info(f"  Found: {r}")
-            return ActionResult(True, f"Found {len(results)} match(es)",
-                                speak=f"Found {len(results)} files matching {name}")
-        return ActionResult(False, f"No files found for '{name}'",
-                            speak=f"No files found matching {name}")
-
-    def _create_file(self, a: dict, raw: str) -> ActionResult:
-        name    = a.get("name", f"note_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
-        content = a.get("content", "")
-        loc     = a.get("location", str(Path.home() / "Desktop"))
-        path    = Path(loc) / name
-        path.write_text(content, encoding="utf-8")
-        os.startfile(str(path))
-        return ActionResult(True, f"Created: {path}",
-                            speak=f"File {name} created on Desktop")
-
-    # ── CLIPBOARD ─────────────────────────────────────────
     def _clipboard(self, a: dict, raw: str) -> ActionResult:
+        """Manage clipboard"""
         cmd = a.get("command", "copy").lower()
+        
         if cmd == "copy":
             pyautogui.hotkey("ctrl", "c")
             return ActionResult(True, "Copied")
@@ -1103,272 +1165,276 @@ class ActionExecutor:
             return ActionResult(True, "Clipboard cleared")
         elif cmd == "get":
             content = pyperclip.paste()
-            return ActionResult(True, "Got clipboard", speak=f"Clipboard says: {content[:120]}")
+            return ActionResult(True, "Got clipboard", speak=f"Clipboard contains: {content[:100]}")
+        
         return ActionResult(False, f"Unknown clipboard command: {cmd}")
 
-    # ── KEYBOARD SHORTCUTS ────────────────────────────────
-    def _keyboard_shortcut(self, a: dict, raw: str) -> ActionResult:
-        shortcut = a.get("shortcut", "")
-        keys     = a.get("keys", [])
+    # ════════════════════════════════════════════════════════
+    # MULTIMEDIA & CONTROL HANDLERS
+    # ════════════════════════════════════════════════════════
 
-        builtin = {
-            "copy":       ["ctrl", "c"],    "paste":    ["ctrl", "v"],
-            "cut":        ["ctrl", "x"],    "undo":     ["ctrl", "z"],
-            "redo":       ["ctrl", "y"],    "save":     ["ctrl", "s"],
-            "save_all":   ["ctrl", "shift", "s"],
-            "select_all": ["ctrl", "a"],    "find":     ["ctrl", "f"],
-            "new":        ["ctrl", "n"],    "open":     ["ctrl", "o"],
-            "print":      ["ctrl", "p"],    "refresh":  ["f5"],
-            "hard_refresh":["ctrl", "shift", "r"],
-            "address_bar":["alt", "d"],
-            "zoom_in":    ["ctrl", "="],    "zoom_out": ["ctrl", "-"],
-            "devtools":   ["f12"],          "screenshot":["win", "shift", "s"],
-            "emoji":      ["win", "."],     "settings": ["win", "i"],
-            "task_view":  ["win", "tab"],
+    def _volume_control(self, a: dict, raw: str) -> ActionResult:
+        """Control system volume using nircmd or fallback to pyautogui"""
+        # Brain sends command in parameters.action, fall back to command or action keys
+        params = a.get("parameters", {})
+        cmd = params.get("action") or a.get("command") or "up"
+        cmd = cmd.lower() if cmd else "up"
+        steps = int(a.get("steps", 5))
+
+        log.info(f"Volume control: {cmd} ({steps} steps)")
+        
+        # Method 1: Try nircmd (more reliable for Windows)
+        try:
+            if cmd in ("mute", "toggle"):
+                result = subprocess.run(
+                    ["nircmd", "mutesysvolume", "1"], 
+                    timeout=2, 
+                    capture_output=True
+                )
+                if result.returncode == 0:
+                    log.info("[OK] Muted via nircmd")
+                    return ActionResult(True, "Muted", speak="Muted volume")
+            elif cmd in ("unmute",):
+                result = subprocess.run(
+                    ["nircmd", "mutesysvolume", "0"], 
+                    timeout=2, 
+                    capture_output=True
+                )
+                if result.returncode == 0:
+                    log.info("[OK] Unmuted via nircmd")
+                    return ActionResult(True, "Unmuted", speak="Unmuted volume")
+            elif cmd in ("up", "increase"):
+                for i in range(steps):
+                    subprocess.run(
+                        ["nircmd", "changesysvolume", "5000"], 
+                        timeout=2, 
+                        capture_output=True
+                    )
+                log.info(f"[OK] Volume up: +{steps} steps via nircmd")
+                return ActionResult(True, f"Volume +{steps}", speak="Volume increased")
+            elif cmd in ("down", "decrease"):
+                for i in range(steps):
+                    subprocess.run(
+                        ["nircmd", "changesysvolume", "-5000"], 
+                        timeout=2, 
+                        capture_output=True
+                    )
+                log.info(f"[OK] Volume down: -{steps} steps via nircmd")
+                return ActionResult(True, f"Volume -{steps}", speak="Volume decreased")
+        except FileNotFoundError:
+            log.debug("nircmd not found, falling back to pyautogui")
+        except Exception as e:
+            log.debug(f"nircmd failed: {e}, falling back to pyautogui")
+        
+        # Fallback: pyautogui keyboard events
+        try:
+            if cmd in ("up", "increase"):
+                for _ in range(steps):
+                    pyautogui.press("volumeup")
+                log.warning(f"[WARN] Volume up via pyautogui (fallback)")
+            elif cmd in ("down", "decrease"):
+                for _ in range(steps):
+                    pyautogui.press("volumedown")
+                log.warning(f"[WARN] Volume down via pyautogui (fallback)")
+            elif cmd in ("mute", "toggle"):
+                pyautogui.press("volumemute")
+                log.warning(f"[WARN] Volume mute via pyautogui (fallback)")
+            
+            time.sleep(0.3)
+            return ActionResult(True, f"Volume {cmd}", speak=f"Volume {cmd}")
+        except Exception as e:
+            log.error(f"[ERROR] All volume methods failed: {e}")
+            return ActionResult(False, f"Volume control failed: {e}")
+
+    def _media_control(self, a: dict, raw: str) -> ActionResult:
+        """Control media playback"""
+        cmd = a.get("command", "").lower()
+        
+        key_map = {
+            "play": "playpause",
+            "pause": "playpause",
+            "play_pause": "playpause",
+            "next": "nexttrack",
+            "previous": "prevtrack",
+            "prev": "prevtrack",
         }
-
-        final_keys = builtin.get(shortcut, keys)
-        if isinstance(final_keys, str):
-            final_keys = final_keys.split("+")
-
-        if final_keys:
-            time.sleep(0.2)
-            pyautogui.hotkey(*final_keys)
-            return ActionResult(True, f"Hotkey: {'+'.join(final_keys)}")
-        return ActionResult(False, "No keys to press")
-
-    def _hotkey(self, a: dict, raw: str) -> ActionResult:
-        """Raw hotkey from action."""
-        keys = a.get("keys", [])
-        if isinstance(keys, str):
-            keys = keys.split("+")
-        if keys:
-            time.sleep(0.2)
-            pyautogui.hotkey(*keys)
-            return ActionResult(True, f"Pressed: {'+'.join(keys)}")
-        return ActionResult(False, "No keys given")
-
-    # ── RUN SHELL COMMAND ────────────────────────────────
-    def _run_command(self, a: dict, raw: str) -> ActionResult:
-        cmd = a.get("command", "")
-        if not cmd:
-            return ActionResult(False, "No command given")
-        try:
-            result = subprocess.run(cmd, shell=True, capture_output=True,
-                                    text=True, timeout=15)
-            output = result.stdout.strip() or result.stderr.strip() or "Done"
-            log.info(f"Run command output: {output[:200]}")
-            return ActionResult(True, output[:200], speak=f"Command executed")
-        except subprocess.TimeoutExpired:
-            return ActionResult(False, "Command timed out")
-        except Exception as e:
-            return ActionResult(False, str(e))
-
-    # ── INFO QUERIES ──────────────────────────────────────
-    def _get_info(self, a: dict, raw: str) -> ActionResult:
-        info_type = a.get("type", "time").lower()
-
-        if info_type in ("time", "clock"):
-            text = datetime.now().strftime("It is %I:%M %p")
-            return ActionResult(True, text, speak=text)
-
-        elif info_type == "date":
-            text = datetime.now().strftime("Today is %A, %B %d, %Y")
-            return ActionResult(True, text, speak=text)
-
-        elif info_type == "datetime":
-            text = datetime.now().strftime("It is %I:%M %p on %A, %B %d, %Y")
-            return ActionResult(True, text, speak=text)
-
-        elif info_type == "battery":
-            try:
-                bat = psutil.sensors_battery()
-                if bat:
-                    status = "charging" if bat.power_plugged else "on battery"
-                    text = f"Battery is at {bat.percent:.0f} percent, {status}"
-                    return ActionResult(True, text, speak=text)
-            except Exception:
-                pass
-            return ActionResult(False, "Battery info unavailable",
-                                speak="Battery info is not available on this device")
-
-        elif info_type == "system":
-            cpu = psutil.cpu_percent(interval=1)
-            ram = psutil.virtual_memory()
-            disk = psutil.disk_usage("/")
-            text = (f"CPU at {cpu}%, RAM {ram.percent}% used "
-                    f"({ram.used // 1024**2} MB of {ram.total // 1024**2} MB), "
-                    f"Disk {disk.percent}% used")
-            log.info(text)
-            return ActionResult(True, text, speak=text)
-
-        elif info_type == "ip":
-            try:
-                resp = requests.get("https://api.ipify.org", timeout=6)
-                text = f"Your public IP address is {resp.text}"
-                return ActionResult(True, text, speak=text)
-            except Exception:
-                return ActionResult(False, "Could not fetch IP",
-                                    speak="Could not get your IP address")
-
-        elif info_type == "network":
-            stats = psutil.net_if_stats()
-            active = [iface for iface, s in stats.items() if s.isup]
-            text = f"Active interfaces: {', '.join(active)}"
-            return ActionResult(True, text, speak=text)
-
-        elif info_type == "uptime":
-            boot  = datetime.fromtimestamp(psutil.boot_time())
-            delta = datetime.now() - boot
-            hours, rem = divmod(int(delta.total_seconds()), 3600)
-            mins  = rem // 60
-            text  = f"System has been up for {hours} hours and {mins} minutes"
-            return ActionResult(True, text, speak=text)
-
-        return ActionResult(False, f"Unknown info type: {info_type}")
-
-    # ── CALCULATOR ────────────────────────────────────────
-    def _calculate(self, a: dict, raw: str) -> ActionResult:
-        expr = a.get("expression", "")
-        if not expr:
-            return ActionResult(False, "No expression given")
-        try:
-            safe_env = {k: getattr(math, k) for k in dir(math) if not k.startswith("_")}
-            safe_env["abs"] = abs
-            result = eval(expr, {"__builtins__": {}}, safe_env)
-            if isinstance(result, float) and result.is_integer():
-                result = int(result)
-            text = f"{expr} equals {result}"
-            log.info(f"Calculation: {text}")
-            return ActionResult(True, text, speak=text)
-        except Exception as e:
-            return ActionResult(False, f"Calculation error: {e}",
-                                speak="Sorry, I couldn't calculate that")
-
-    # ── SCROLL ───────────────────────────────────────────
-    def _scroll(self, a: dict, raw: str) -> ActionResult:
-        direction = a.get("direction", "down").lower()
-        amount    = int(a.get("amount", 3))
-        factor    = 3 if direction == "up" else -3
-        pyautogui.scroll(factor * amount)
-        return ActionResult(True, f"Scrolled {direction}")
-
-    def _click(self, a: dict, raw: str) -> ActionResult:
-        button = a.get("button", "left").lower()
-        double = a.get("double", False)
-        if double:
-            pyautogui.doubleClick(button=button)
-        else:
-            pyautogui.click(button=button)
-        return ActionResult(True, f"Clicked {button}")
-
-    # ── REMINDER ─────────────────────────────────────────
-    def _set_reminder(self, a: dict, raw: str) -> ActionResult:
-        message = a.get("message", "Reminder!")
-        seconds = int(a.get("seconds", 60))
-
-        def _remind():
-            time.sleep(seconds)
-            pyautogui.alert(text=message, title="⏰ ProVoiceAgent Reminder", button="OK")
-
-        threading.Thread(target=_remind, daemon=True).start()
-        mins = seconds // 60
-        text = f"Reminder set for {mins} minute{'s' if mins != 1 else ''}"
-        return ActionResult(True, text, speak=text)
-
-    # ── MISC ─────────────────────────────────────────────
-    def _toggle_wifi(self, a: dict, raw: str) -> ActionResult:
-        # Windows: toggle via netsh (requires elevated prompt ideally)
-        try:
-            # This works for some Wi-Fi adapters
-            subprocess.run(
-                ["netsh", "interface", "set", "interface", "Wi-Fi", "enable"],
-                capture_output=True, check=False
-            )
-            return ActionResult(True, "Wi-Fi toggled")
-        except Exception as e:
-            return ActionResult(False, str(e))
+        
+        key = key_map.get(cmd)
+        if key:
+            pyautogui.press(key)
+            return ActionResult(True, f"Media: {cmd}")
+        
+        return ActionResult(False, f"Unknown media command: {cmd}")
 
     def _brightness(self, a: dict, raw: str) -> ActionResult:
+        """Control brightness"""
         level = a.get("level", 70)
+        
         try:
-            subprocess.run(
-                ["PowerShell", "-NoProfile", "-Command",
-                 f"(Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightnessMethods)"
-                 f".WmiSetBrightness(1,{level})"],
-                capture_output=True, check=False
-            )
+            subprocess.run([
+                "PowerShell", "-NoProfile", "-Command",
+                f"(Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightnessMethods)"
+                f".WmiSetBrightness(1,{level})"
+            ], capture_output=True, check=False)
+            
             return ActionResult(True, f"Brightness set to {level}%")
         except Exception as e:
             return ActionResult(False, str(e))
 
-    # ══════════════════════════════════════════════════════════
-    # ENTERPRISE-LEVEL UNIVERSAL ACTIONS (NEW)
-    # ══════════════════════════════════════════════════════════
+    # ════════════════════════════════════════════════════════
+    # WINDOW & KEYBOARD HANDLERS
+    # ════════════════════════════════════════════════════════
 
-    def _delete_file(self, a: dict, raw: str) -> ActionResult:
-        """Delete a file or folder."""
-        path = a.get("path", "")
-        if not path:
-            return ActionResult(False, "No file path given")
+    def _window_control(self, a: dict, raw: str) -> ActionResult:
+        """Control windows"""
+        cmd = a.get("command", "").lower()
+        
+        actions_map = {
+            "minimize": lambda: pyautogui.hotkey("win", "down"),
+            "maximize": lambda: pyautogui.hotkey("win", "up"),
+            "close": lambda: pyautogui.hotkey("alt", "f4"),
+            "fullscreen": lambda: pyautogui.press("f11"),
+            "switch": lambda: pyautogui.hotkey("alt", "tab"),
+        }
+        
+        fn = actions_map.get(cmd)
+        if fn:
+            time.sleep(0.2)
+            fn()
+            return ActionResult(True, f"Window: {cmd}")
+        
+        return ActionResult(False, f"Unknown window command: {cmd}")
+
+    def _keyboard_shortcut(self, a: dict, raw: str) -> ActionResult:
+        """Execute keyboard shortcuts - supports Win+L, Ctrl+C, Alt+Tab, etc."""
+        # Brain sends shortcut in parameters, fall back to shortcut key
+        params = a.get("parameters", {})
+        shortcut = params.get("action") or params.get("shortcut") or a.get("shortcut", "")
+        shortcut = shortcut.strip() if shortcut else ""
+        
+        if not shortcut:
+            return ActionResult(False, "No shortcut specified")
+        
+        log.info(f"Executing keyboard shortcut: {shortcut}")
+        
+        # Hardcoded shortcuts with alternative names
+        builtin = {
+            "copy": ["ctrl", "c"],
+            "paste": ["ctrl", "v"],
+            "cut": ["ctrl", "x"],
+            "undo": ["ctrl", "z"],
+            "save": ["ctrl", "s"],
+            "select_all": ["ctrl", "a"],
+            "select all": ["ctrl", "a"],
+            "find": ["ctrl", "f"],
+            "new": ["ctrl", "n"],
+            "open": ["ctrl", "o"],
+            "print": ["ctrl", "p"],
+            "refresh": ["f5"],
+            "devtools": ["f12"],
+            "lock": ["win", "l"],
+            "lock screen": ["win", "l"],
+            "lock_screen": ["win", "l"],
+            "win+l": ["win", "l"],
+            "window+l": ["win", "l"],
+        }
+        
+        # Check builtin names first
+        shortcut_lower = shortcut.lower()
+        keys = builtin.get(shortcut_lower)
+        if keys:
+            try:
+                # Special handling for screen lock - use Windows API
+                if shortcut_lower in ("lock", "lock screen", "lock_screen", "win+l", "window+l"):
+                    try:
+                        user32 = ctypes.windll.user32
+                        user32.LockWorkStation()
+                        log.info(f"[OK] Locked screen via Windows API")
+                        return ActionResult(True, "Screen locked", speak="Screen locked")
+                    except Exception as e:
+                        log.debug(f"Windows API lock failed: {e}, trying hotkey")
+                
+                time.sleep(0.2)
+                pyautogui.hotkey(*keys)
+                time.sleep(0.5)  # Wait for action to complete
+                log.info(f"[OK] Executed shortcut: {shortcut}")
+                return ActionResult(True, f"Shortcut: {shortcut}", speak=f"Executed")
+            except Exception as e:
+                log.error(f"Failed to execute: {e}")
+                return ActionResult(False, f"Failed: {e}")
+        
+        # Parse Win+L, Ctrl+C, Alt+Tab format
         try:
-            p = Path(path)
-            if p.is_dir():
-                import shutil
-                shutil.rmtree(p)
-            else:
-                p.unlink()
-            return ActionResult(True, f"Deleted: {path}")
+            parts = shortcut.replace(" ", "").split("+")
+            keys_to_press = []
+            
+            key_map = {
+                "win": "win", "windows": "win", "⊞": "win",
+                "ctrl": "ctrl", "control": "ctrl",
+                "alt": "alt",
+                "shift": "shift",
+            }
+            
+            for part in parts:
+                part_lower = part.lower()
+                if part_lower in key_map:
+                    keys_to_press.append(key_map[part_lower])
+                else:
+                    keys_to_press.append(part_lower)
+            
+            if not keys_to_press:
+                return ActionResult(False, f"Invalid format: {shortcut}")
+            
+            log.info(f"Pressing keys: {keys_to_press}")
+            
+            # Special case: Win+L lock screen via Windows API
+            if len(keys_to_press) == 2 and "win" in keys_to_press and "l" in keys_to_press:
+                try:
+                    user32 = ctypes.windll.user32
+                    user32.LockWorkStation()
+                    log.info(f"[OK] Screen locked via Windows API")
+                    return ActionResult(True, "Screen locked", speak="Screen locked")
+                except Exception as e:
+                    log.debug(f"Windows API lock failed: {e}, trying hotkey")
+            
+            time.sleep(0.2)
+            pyautogui.hotkey(*keys_to_press)
+            time.sleep(0.5)
+            log.info(f"[OK] Executed: {shortcut}")
+            return ActionResult(True, f"Executed: {shortcut}", speak=f"Done")
+        
         except Exception as e:
-            return ActionResult(False, f"Cannot delete {path}: {e}")
+            log.error(f"Shortcut parsing error: {e}")
+            return ActionResult(False, f"Error: {e}")
 
-    def _rename_file(self, a: dict, raw: str) -> ActionResult:
-        """Rename a file or folder."""
-        old_path = a.get("path", "")
-        new_name = a.get("new_name", "")
-        if not old_path or not new_name:
-            return ActionResult(False, "Missing path or new name")
-        try:
-            old = Path(old_path)
-            new = old.parent / new_name
-            old.rename(new)
-            return ActionResult(True, f"Renamed to: {new_name}")
-        except Exception as e:
-            return ActionResult(False, str(e))
+    def _hotkey(self, a: dict, raw: str) -> ActionResult:
+        """Execute raw hotkey"""
+        keys = a.get("keys", [])
+        
+        if isinstance(keys, str):
+            keys = keys.split("+")
+        
+        if keys:
+            time.sleep(0.2)
+            pyautogui.hotkey(*keys)
+            return ActionResult(True, f"Pressed: {'+'.join(keys)}")
+        
+        return ActionResult(False, "No keys given")
 
-    def _navigate_to(self, a: dict, raw: str) -> ActionResult:
-        """Navigate to any location - app, URL, or file path."""
-        location = a.get("location", "").strip()
-        if not location:
-            return ActionResult(False, "No location given")
-        
-        # Check if it's a URL/website
-        if "http" in location or "." in location.split("/")[-1]:
-            return self._open_url({"url": location}, raw)
-        
-        # Check if it's a file/folder path
-        p = Path(location)
-        if p.exists():
-            if p.is_dir():
-                return self._open_path({"path": location}, raw)
-            else:
-                return self._open_file({"path": location}, raw)
-        
-        # Try as app
-        return self._open_app({"app": location}, raw)
+    # ════════════════════════════════════════════════════════
+    # UI AUTOMATION HANDLERS
+    # ════════════════════════════════════════════════════════
 
     def _click_element(self, a: dict, raw: str) -> ActionResult:
-        """Click a UI element (requires element identification)."""
+        """Click at coordinates"""
         x = a.get("x")
         y = a.get("y")
         button = a.get("button", "left").lower()
-        wait_ms = int(a.get("wait", 100))
         
         if x is None or y is None:
-            return ActionResult(False, "Coordinates required (x, y)")
+            return ActionResult(False, "Coordinates required")
         
         try:
-            time.sleep(wait_ms / 1000)
             if button == "right":
                 pyautogui.rightClick(x, y)
             elif button == "middle":
@@ -1380,76 +1446,57 @@ class ActionExecutor:
             return ActionResult(False, str(e))
 
     def _find_and_click(self, a: dict, raw: str) -> ActionResult:
-        """Find text/button on screen and click it (requires text recognition)."""
+        """Find text and click"""
         text = a.get("text", "").strip()
-        if not text:
-            return ActionResult(False, "No text to find")
         
-        # This is a placeholder - full implementation would use OCR/screen analysis
         try:
-            # Try keyboard navigation as fallback
             pyautogui.typewrite(text[:20], interval=0.05)
             time.sleep(0.2)
             pyautogui.press("tab")
-            return ActionResult(True, f"Searched for and navigated to: {text}")
-        except Exception as e:
-            return ActionResult(False, f"Could not find '{text}': {e}")
-
-    def _wait_for_element(self, a: dict, raw: str) -> ActionResult:
-        """Wait for a UI element to appear (polling-based)."""
-        timeout = int(a.get("timeout", 10))
-        interval = float(a.get("interval", 0.5))
-        
-        try:
-            elapsed = 0
-            while elapsed < timeout:
-                time.sleep(interval)
-                elapsed += interval
-                # Placeholder: could integrate with accessibility APIs
-            return ActionResult(True, f"Waited {timeout:d}s for element")
+            return ActionResult(True, f"Found and navigated to: {text}")
         except Exception as e:
             return ActionResult(False, str(e))
 
     def _fill_form(self, a: dict, raw: str) -> ActionResult:
-        """Fill a form by clicking fields and typing values."""
-        fields = a.get("fields", {})  # {"field_name": "value", ...}
+        """Fill form fields"""
+        fields = a.get("fields", {})
+        
         if not fields:
-            return ActionResult(False, "No form fields given")
+            return ActionResult(False, "No fields given")
         
         try:
             for field_name, value in fields.items():
-                # Try to find and click field, then type value
                 time.sleep(0.3)
                 pyautogui.typewrite(str(value)[:200], interval=0.02)
-                pyautogui.press("tab")  # Move to next field
-            return ActionResult(True, f"Filled {len(fields)} form fields")
+                pyautogui.press("tab")
+            
+            return ActionResult(True, f"Filled {len(fields)} fields")
         except Exception as e:
             return ActionResult(False, str(e))
 
     def _submit_form(self, a: dict, raw: str) -> ActionResult:
-        """Submit a form (Enter or click submit button)."""
+        """Submit form"""
         method = a.get("method", "enter").lower()
+        
         try:
             if method in ("enter", "return"):
                 pyautogui.press("return")
             elif method == "tab":
                 pyautogui.press("tab")
                 pyautogui.press("return")
-            else:
-                # Try to find submit button
-                pyautogui.hotkey("ctrl", "return")  # Common submission shortcut
+            
             time.sleep(0.5)
             return ActionResult(True, "Form submitted")
         except Exception as e:
             return ActionResult(False, str(e))
 
     def _select_dropdown(self, a: dict, raw: str) -> ActionResult:
-        """Select from a dropdown menu."""
+        """Select from dropdown"""
         option = a.get("option", "").strip()
+        
         try:
-            pyautogui.press("space")  # Open dropdown
+            pyautogui.press("space")
             time.sleep(0.3)
-            # Navigate to option
             pyautogui.typewrite(option[:30], interval=0.05)
             time.sleep(0.2)
             pyautogui.press("return")
@@ -1457,8 +1504,18 @@ class ActionExecutor:
         except Exception as e:
             return ActionResult(False, str(e))
 
+    def _scroll(self, a: dict, raw: str) -> ActionResult:
+        """Scroll"""
+        direction = a.get("direction", "down").lower()
+        amount = int(a.get("amount", 3))
+        
+        factor = 3 if direction == "up" else -3
+        pyautogui.scroll(factor * amount)
+        
+        return ActionResult(True, f"Scrolled {direction}")
+
     def _mouse_move(self, a: dict, raw: str) -> ActionResult:
-        """Move mouse to coordinates."""
+        """Move mouse"""
         x = a.get("x")
         y = a.get("y")
         duration = float(a.get("duration", 0.5))
@@ -1473,7 +1530,7 @@ class ActionExecutor:
             return ActionResult(False, str(e))
 
     def _mouse_click(self, a: dict, raw: str) -> ActionResult:
-        """Click at coordinates."""
+        """Click at coordinates"""
         x = a.get("x")
         y = a.get("y")
         clicks = int(a.get("clicks", 1))
@@ -1489,7 +1546,7 @@ class ActionExecutor:
             return ActionResult(False, str(e))
 
     def _mouse_drag(self, a: dict, raw: str) -> ActionResult:
-        """Drag mouse from one point to another."""
+        """Drag mouse"""
         x1 = a.get("x1")
         y1 = a.get("y1")
         x2 = a.get("x2")
@@ -1497,7 +1554,7 @@ class ActionExecutor:
         duration = float(a.get("duration", 1.0))
         
         if any(v is None for v in [x1, y1, x2, y2]):
-            return ActionResult(False, "Start and end coordinates required")
+            return ActionResult(False, "Coordinates required")
         
         try:
             pyautogui.drag(x2 - x1, y2 - y1, duration=duration)
@@ -1505,44 +1562,154 @@ class ActionExecutor:
         except Exception as e:
             return ActionResult(False, str(e))
 
-    def _keyboard_input(self, a: dict, raw: str) -> ActionResult:
-        """Send raw keyboard input (supports special keys)."""
-        keys = a.get("keys", [])
-        text = a.get("text", "")
+    # ════════════════════════════════════════════════════════
+    # SCREENSHOT HANDLERS
+    # ════════════════════════════════════════════════════════
+
+    def _screenshot(self, a: dict, raw: str) -> ActionResult:
+        """Take screenshot"""
+        dest = Path(a.get("path", str(Path.home() / "Pictures" / "Screenshots")))
+        dest.mkdir(parents=True, exist_ok=True)
         
-        if isinstance(keys, str):
-            keys = keys.split("+")
+        name = f"screenshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+        path = dest / name
+        
+        time.sleep(0.6)
+        pyautogui.screenshot().save(str(path))
+        
+        return ActionResult(True, f"Screenshot saved: {path}", speak="Screenshot saved")
+
+    def _screenshot_region(self, a: dict, raw: str) -> ActionResult:
+        """Screenshot specific region"""
+        x = a.get("x", 0)
+        y = a.get("y", 0)
+        width = a.get("width", 400)
+        height = a.get("height", 300)
+        
+        dest = Path(a.get("path", str(Path.home() / "Pictures")))
+        dest.mkdir(parents=True, exist_ok=True)
+        
+        name = f"region_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+        path = dest / name
+        
+        img = pyautogui.screenshot(region=(x, y, width, height))
+        img.save(str(path))
+        
+        return ActionResult(True, f"Region screenshot saved: {path}")
+
+    # ════════════════════════════════════════════════════════
+    # INFO & UTILITY HANDLERS
+    # ════════════════════════════════════════════════════════
+
+    def _get_info(self, a: dict, raw: str) -> ActionResult:
+        """Get system information"""
+        info_type = a.get("type", "time").lower()
+
+        if info_type in ("time", "clock"):
+            text = datetime.now().strftime("It is %I:%M %p")
+            return ActionResult(True, text, speak=text)
+
+        elif info_type == "date":
+            text = datetime.now().strftime("Today is %A, %B %d, %Y")
+            return ActionResult(True, text, speak=text)
+
+        elif info_type == "battery":
+            try:
+                bat = psutil.sensors_battery()
+                if bat:
+                    status = "charging" if bat.power_plugged else "on battery"
+                    text = f"Battery at {bat.percent:.0f}%, {status}"
+                    return ActionResult(True, text, speak=text)
+            except:
+                pass
+            return ActionResult(False, "Battery info unavailable")
+
+        return ActionResult(False, f"Unknown info type: {info_type}")
+
+    def _calculate(self, a: dict, raw: str) -> ActionResult:
+        """Calculate mathematical expression"""
+        expr = a.get("expression", "")
+        
+        if not expr:
+            return ActionResult(False, "No expression given")
         
         try:
-            if text:
-                pyautogui.typewrite(text, interval=0.05)
-            if keys:
-                pyautogui.hotkey(*keys)
-            return ActionResult(True, f"Keyboard input executed")
+            safe_env = {k: getattr(math, k) for k in dir(math) if not k.startswith("_")}
+            safe_env["abs"] = abs
+            result = eval(expr, {"__builtins__": {}}, safe_env)
+            
+            if isinstance(result, float) and result.is_integer():
+                result = int(result)
+            
+            text = f"{expr} equals {result}"
+            return ActionResult(True, text, speak=text)
+        except Exception as e:
+            return ActionResult(False, f"Calculation error: {e}")
+
+    def _answer(self, a: dict, raw: str) -> ActionResult:
+        """Speak answer"""
+        answer = a.get("text", "")
+        return ActionResult(True, answer, speak=answer)
+
+    def _analyze_system(self, a: dict, raw: str) -> ActionResult:
+        """Deep system analysis"""
+        info = self.system_intel.get_complete_system_info()
+        analysis = {
+            "health": "Good" if info['cpu']['percent_per_core'][0] < 80 else "Warning",
+            "recommendations": []
+        }
+        
+        if info['memory']['percent'] > 85:
+            analysis['recommendations'].append("Close some applications to free memory")
+        if info['disk']['percent'] > 90:
+            analysis['recommendations'].append("Consider freeing up disk space")
+        
+        return ActionResult(True, json.dumps(analysis), data=analysis)
+
+    def _run_command(self, a: dict, raw: str) -> ActionResult:
+        """Run shell command"""
+        cmd = a.get("command", "")
+        
+        if not cmd:
+            return ActionResult(False, "No command given")
+        
+        try:
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=15)
+            output = result.stdout.strip() or result.stderr.strip() or "Done"
+            return ActionResult(True, output[:200], speak="Command executed")
+        except subprocess.TimeoutExpired:
+            return ActionResult(False, "Command timed out")
         except Exception as e:
             return ActionResult(False, str(e))
 
-    def _focus_window(self, a: dict, raw: str) -> ActionResult:
-        """Focus/activate a specific window."""
-        app = a.get("app", "").strip()
-        if not app:
-            return ActionResult(False, "No app specified")
+    def _set_reminder(self, a: dict, raw: str) -> ActionResult:
+        """Set system reminder"""
+        message = a.get("message", "Reminder!")
+        seconds = int(a.get("seconds", 60))
+
+        def _remind():
+            time.sleep(seconds)
+            pyautogui.alert(text=message, title="⏰ ProVoiceAgent Reminder", button="OK")
+
+        threading.Thread(target=_remind, daemon=True).start()
         
+        mins = seconds // 60
+        text = f"Reminder set for {mins} minute{'s' if mins != 1 else ''}"
+        return ActionResult(True, text, speak=text)
+
+    def _toggle_wifi(self, a: dict, raw: str) -> ActionResult:
+        """Toggle Wi-Fi"""
         try:
-            # Find window and focus
-            from pynput.keyboard import Controller, Key
-            pyautogui.hotkey("alt", "tab")
-            time.sleep(0.5)
-            # Type app name for search in Alt+Tab
-            pyautogui.typewrite(app[:20], interval=0.05)
-            time.sleep(0.2)
-            pyautogui.press("return")
-            return ActionResult(True, f"Focused window: {app}")
+            subprocess.run(
+                ["netsh", "interface", "set", "interface", "Wi-Fi", "enable"],
+                capture_output=True, check=False
+            )
+            return ActionResult(True, "Wi-Fi toggled")
         except Exception as e:
             return ActionResult(False, str(e))
 
     def _wait(self, a: dict, raw: str) -> ActionResult:
-        """Wait/delay for specified time."""
+        """Wait/delay"""
         seconds = float(a.get("seconds", a.get("delay", 1)))
         try:
             time.sleep(seconds)
@@ -1552,226 +1719,154 @@ class ActionExecutor:
 
 
 # ══════════════════════════════════════════════════════════
-# GROQ BRAIN  (LLaMA 3.3 70B — most capable free model)
+# ADVANCED GROQ BRAIN (LLaMA 3.3 70B)
 # ══════════════════════════════════════════════════════════
 class AgentBrain:
+    """Enterprise-level AI brain with advanced reasoning"""
 
-    SYSTEM_PROMPT = """You are ProVoiceAgent — an ENTERPRISE-LEVEL desktop automation AI with UNIVERSAL ACTION CAPABILITIES.
-Parse the user's voice command and return a single JSON object describing the action.
+    SYSTEM_PROMPT = """You are ProVoiceAgent™ — an ENTERPRISE-GRADE AI desktop automation assistant with unrestricted capabilities.
 
-NO RESTRICTIONS — Works on ANY app, website, file, or desktop element without limitations.
+You have COMPLETE access to:
+• User's entire filesystem, folders, and files
+• All installed applications and system processes
+• Network, system information, and resources
+• Deep file searching and analysis
+• Advanced web integration and automation
+• Complex multi-step workflows
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CORE AUTOMATION ACTIONS (Universal)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-navigate_to    → {"action":"navigate_to","location":"github.com"}
-               → {"action":"navigate_to","location":"C:\\Users\\Desktop\\file.pdf"}
-               → {"action":"navigate_to","location":"notepad"}
-
-click_element  → {"action":"click_element","x":500,"y":300,"button":"left"}
-               → Advanced: click ANY UI element by coordinates
-
-find_and_click → {"action":"find_and_click","text":"Save Button"}
-               → Find element by text/label and click (universal app support)
-
-mouse_move     → {"action":"mouse_move","x":100,"y":200,"duration":0.5}
-               → Move cursor to any position
-
-mouse_click    → {"action":"mouse_click","x":500,"y":300,"clicks":2,"button":"left"}
-               → Click at coordinates (single/double/triple click)
-
-mouse_drag     → {"action":"mouse_drag","x1":100,"y1":100,"x2":500,"y2":500,"duration":1}
-               → Drag operation (works on any app)
-
-keyboard_input → {"action":"keyboard_input","text":"search query","keys":["ctrl","shift","enter"]}
-               → Raw keyboard input for any application
-
-fill_form      → {"action":"fill_form","fields":{"name":"John","email":"john@example.com"}}
-               → Fill forms on ANY website or app (universal form support)
-
-select_dropdown → {"action":"select_dropdown","option":"Option Name"}
-               → Select from any dropdown menu (works universally)
-
-submit_form    → {"action":"submit_form","method":"enter"}
-               → Submit forms on any website/app
-
-focus_window   → {"action":"focus_window","app":"chrome"}
-               → Focus/switch to any running window
-
-wait           → {"action":"wait","seconds":2}
-               → Wait before executing next action
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-FILE & FOLDER OPERATIONS
+CORE CAPABILITIES:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-open_file      → {"action":"open_file","path":"C:\\Users\\User\\Desktop\\report.pdf"}
-               → Opens ANY file type (pdf, doc, image, video, etc)
+1. FILE MANAGEMENT
+   open_file → Open any file (docs, videos, images, etc.)
+   find_file → Deep search for files with pattern matching
+   create_file → Create files with content
+   delete_file, rename_file, copy_file, move_file → Full file control
+   file_info → Detailed file metadata
+   recent_files → Access recently modified files
+   open_path → Open folders in explorer
 
-open_path      → {"action":"open_path","path":"C:\\Users\\User\\Downloads"}
-               → Open any folder
+2. APPLICATION MANAGEMENT
+   open_app → Launch ANY installed app (100+ supported)
+   close_app → Close running applications
+   restart_app → Restart applications
+   switch_app → Switch between running apps
+   list_apps → Show all running applications
+   app_status → Check if app is running
 
-find_file      → {"action":"find_file","name":"resume","dir":"C:\\Users\\User\\Documents"}
-               → Find any file on disk
+3. WEB & INTERNET
+   search_web → Search Google, YouTube, GitHub, etc.
+   open_url → Open any website
+   browser_action → Control browser (back, forward, reload, etc.)
 
-create_file    → {"action":"create_file","name":"todo.txt","content":"task list","location":"C:\\Desktop"}
+4. TEXT & INPUT
+   type_text → Type into any application
+   paste_text → Paste content
+   write_notepad → Create text in Notepad
+   clipboard → Manage clipboard
 
-delete_file    → {"action":"delete_file","path":"C:\\Users\\Desktop\\old_file.txt"}
+5. SYSTEM INTELLIGENCE
+   system_info → Complete system snapshot (CPU, RAM, disk, processes)
+   disk_analysis → See what's consuming disk space
+   running_processes → List all running processes
+   process_control → Kill, suspend, or resume processes
+   analyze_system → Deep system analysis with recommendations
 
-rename_file    → {"action":"rename_file","path":"C:\\Users\\Desktop\\file.txt","new_name":"renamed.txt"}
+6. MEDIA & CONTROL
+   volume_control → Adjust volume, mute
+   media_control → Play, pause, next, previous
+   brightness → Control display brightness
+   window_control → Minimize, maximize, close windows
+   keyboard_shortcut → Execute shortcuts (copy, paste, save, etc.)
+   hotkey → Custom keyboard combinations
 
+7. UI AUTOMATION (Universal - works on any app/website)
+   click_element → Click at exact coordinates
+   find_and_click → Find text/element and click
+   fill_form → Fill form fields automatically
+   submit_form → Submit forms
+   select_dropdown → Choose from dropdowns
+   scroll → Scroll up/down
+   mouse_move, mouse_click, mouse_drag → Full mouse control
+
+8. UTILITIES
+   screenshot → Capture full screen
+   screenshot_region → Capture specific area
+   calculate → Solve mathematical expressions
+   set_reminder → Set system reminders
+   get_info → Get time, date, battery status
+   run_command → Execute PowerShell/CMD commands
+   wait → Add delays between actions
+
+DECISION RULES (Enterprise Logic):
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-APP MANAGEMENT (Universal across 100+ apps)
+• "Open [any file]" → open_file with path
+• "Find [anything]" → find_file with search pattern
+• "Launch [app name]" → open_app
+• "Search for [query]" → search_web
+• "Click [button/text]" → click_element or find_and_click
+• "Fill out form" → fill_form with field mapping
+• "Show me [data]" → system_info or analyze_system
+• "What's using disk" → disk_analysis
+• "Restart [app]" → restart_app
+• Multiple actions → Return array of action objects
+
+IMPORTANT NOTES:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✓ NO RESTRICTIONS - works on any desktop element
+✓ INTELLIGENT MATCHING - understands context and variations
+✓ MULTI-STEP WORKFLOWS - can chain actions together
+✓ DEEP SYSTEM ACCESS - full visibility into user's desktop
+✓ COMPLETE INFORMATION - knows user's files, apps, system state
+✓ ENTERPRISE QUALITY - professional-grade automation
 
-open_app       → {"action":"open_app","app":"chrome"}
-               → Works with EVERY installed application - browsers, editors, media players, productivity tools, dev tools, etc.
-
-close_app      → {"action":"close_app","app":"chrome","force":true}
-               → Close ANY running application
-
-restart_app    → {"action":"restart_app","app":"vscode","delay":1}
-
-list_apps      → {"action":"list_apps"}
-
-app_status     → {"action":"app_status","app":"chrome"}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-WEB & COMMUNICATION (Universal)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-search_web     → {"action":"search_web","query":"python tutorials","engine":"google"}
-               engines: google | youtube | bing | github | stackoverflow | reddit | amazon | maps | wikipedia
-
-open_url       → {"action":"open_url","url":"github.com"}
-               → Open ANY URL/website
-
-goto           → {"action":"goto","url":"facebook.com"}
-               → Alias for open_url
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-TEXT & INPUT (Works on ANY application)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-type_text      → {"action":"type_text","text":"Hello World"}
-               → Type into ANY application (no limitations)
-
-paste_text     → {"action":"paste_text","text":"exact text"}
-               → Paste into ANY field
-
-type           → {"action":"type","text":"message"}
-
-paste          → {"action":"paste","text":"content"}
-
-clipboard      → {"action":"clipboard","command":"copy|paste|clear|get"}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SYSTEM CONTROL
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-system_command → {"action":"system_command","command":"shutdown|restart|sleep|hibernate|lock"}
-
-volume_control → {"action":"volume_control","command":"up|down|mute","steps":5}
-
-brightness     → {"action":"brightness","level":75}
-
-toggle_wifi    → {"action":"toggle_wifi"}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-WINDOW & MEDIA CONTROL
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-window_control → {"action":"window_control","command":"maximize|minimize|fullscreen|switch"}
-
-media_control  → {"action":"media_control","command":"play|pause|next|previous"}
-
-keyboard_shortcut → {"action":"keyboard_shortcut","shortcut":"copy|select_all|save|find"}
-
-hotkey         → {"action":"hotkey","keys":["ctrl","shift","esc"]}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SCREENSHOTS & UTILITIES
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-screenshot     → {"action":"screenshot"}
-               → Works on ANY display/app
-
-scroll         → {"action":"scroll","direction":"down","amount":3}
-
-run_command    → {"action":"run_command","command":"python script.py"}
-
-calculate      → {"action":"calculate","expression":"sqrt(144)"}
-
-get_info       → {"action":"get_info","type":"time|system|battery|ip"}
-
-answer         → {"action":"answer","text":"direct factual answer"}
-
-set_reminder   → {"action":"set_reminder","message":"Break time","seconds":300}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-DECISION RULES (Enterprise-Level)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-1. "click the save button"       → find_and_click text="Save"
-2. "fill the form with my info"  → fill_form with fields
-3. "scroll down 5 times"         → scroll direction="down" amount=5
-4. "click at x:500 y:300"        → mouse_click with coordinates
-5. "open any website/app/file"   → navigate_to (auto-detection)
-6. "type in the search box"      → keyboard_input or type_text
-7. "select from dropdown"        → select_dropdown
-8. "submit the form"             → submit_form
-9. "wait then click"             → wait → then click_element
-10. "I want to use [any app]"    → open_app (works with 100+ apps)
-
-KEY POINTS:
-- NO RESTRICTIONS on apps, websites, or files
-- UNIVERSAL app support: Works on Spotify, YouTube, Excel, Chrome, Notepad, Discord, any browser, etc.
-- Works on ANY form, ANY dropdown, ANY button on ANY website
-- Can interact with desktop elements, files, folders without limitations
-- Auto-detect context: URL → browser, path → file manager, app name → launch app
-
-Return ONLY valid JSON. No explanation. No markdown.
+Return ONLY valid JSON (single object or array of objects). No explanation or markdown.
 """
 
     def __init__(self):
         self.api_url = "https://api.groq.com/openai/v1/chat/completions"
         self.headers = {
             "Authorization": f"Bearer {GROQ_API_KEY}",
-            "Content-Type":  "application/json",
+            "Content-Type": "application/json",
         }
-        self.history:  List[ConversationTurn] = []
-        self.max_hist = 6
+        self.history: List[ConversationTurn] = []
+        self.max_hist = 8
 
-    def parse(self, user_text: str) -> Dict[str, Any]:
+    def parse(self, user_text: str, system_context: Dict[str, Any] = None) -> Dict[str, Any]:
+        """Parse user command with system context awareness"""
         context = ""
+        
+        if system_context:
+            context = f"\n\nSystem Context: CPU {system_context.get('cpu', 'N/A')}%, "
+            context += f"RAM {system_context.get('ram', 'N/A')}%, "
+            context += f"Running Apps: {system_context.get('apps', 'N/A')}"
+        
         if self.history:
-            recent  = self.history[-4:]
-            context = "\n\nRecent context:\n" + "\n".join(
+            recent = self.history[-4:]
+            context += "\n\nRecent Context:\n" + "\n".join(
                 f"  {t.role}: {t.content}" for t in recent
             )
 
         payload = {
-            "model":   AGENT_CONFIG.get("model", "llama-3.3-70b-versatile"),
+            "model": AGENT_CONFIG.get("model", "llama-3.3-70b-versatile"),
             "messages": [
                 {"role": "system", "content": self.SYSTEM_PROMPT},
-                {"role": "user",   "content": f"Voice command: {user_text}{context}\n\nJSON:"},
+                {"role": "user", "content": f"Voice command: {user_text}{context}\n\nJSON:"},
             ],
-            "max_tokens":     350,
-            "temperature":    0.05,
+            "max_tokens": 500,
+            "temperature": 0.05,
             "response_format": {"type": "json_object"},
         }
 
         try:
-            resp = requests.post(self.api_url, headers=self.headers,
-                                 json=payload, timeout=15)
+            resp = requests.post(self.api_url, headers=self.headers, json=payload, timeout=15)
             resp.raise_for_status()
             raw = resp.json()["choices"][0]["message"]["content"].strip()
             action = json.loads(raw)
             log.info(f"Brain → {action}")
 
             # Store turns
-            self.history.append(ConversationTurn("user",      user_text))
+            self.history.append(ConversationTurn("user", user_text))
             self.history.append(ConversationTurn("assistant", json.dumps(action)))
             if len(self.history) > self.max_hist * 2:
                 self.history = self.history[-self.max_hist * 2:]
@@ -1781,37 +1876,39 @@ Return ONLY valid JSON. No explanation. No markdown.
         except json.JSONDecodeError as e:
             log.error(f"JSON parse fail: {e}")
         except requests.HTTPError as e:
-            log.error(f"Groq HTTP error {e.response.status_code}: {e.response.text[:200]}")
+            log.error(f"Groq HTTP error: {e.response.status_code}")
         except requests.RequestException as e:
             log.error(f"Groq request error: {e}")
         except Exception as e:
-            log.error(f"Brain unexpected error: {e}", exc_info=True)
+            log.error(f"Brain error: {e}", exc_info=True)
 
         return {"action": "paste_text", "text": user_text}
 
 
 # ══════════════════════════════════════════════════════════
-# FLOATING STATUS HUD  (Tkinter borderless overlay)
+# FLOATING STATUS HUD
 # ══════════════════════════════════════════════════════════
 class StatusHUD:
+    """Modern floating status display"""
+    
     COLORS = {
-        "ready":      "#00ff88",
-        "listening":  "#00ff88",
+        "ready": "#00ff88",
+        "listening": "#00ff88",
         "processing": "#ffaa00",
-        "executing":  "#00aaff",
-        "success":    "#00ff88",
-        "error":      "#ff4455",
-        "speaking":   "#cc88ff",
+        "executing": "#00aaff",
+        "success": "#00ff88",
+        "error": "#ff4455",
+        "speaking": "#cc88ff",
     }
 
     def __init__(self):
-        self._q       = queue.Queue()
+        self._q = queue.Queue()
         self._running = False
-        self._thread  = threading.Thread(target=self._run, daemon=True)
+        self._thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self):
         self._thread.start()
-        time.sleep(0.4)          # let Tk initialize
+        time.sleep(0.4)
 
     def show(self, msg: str, state: str = "ready"):
         self._q.put(("show", msg, self.COLORS.get(state, "#ffffff")))
@@ -1827,23 +1924,16 @@ class StatusHUD:
 
         sw = root.winfo_screenwidth()
         sh = root.winfo_screenheight()
-        w, h = 380, 54
+        w, h = 420, 60
         root.geometry(f"{w}x{h}+{sw - w - 16}+{sh - h - 50}")
 
-        # Dot indicator
-        dot = tk.Label(root, text="◉", font=("Segoe UI", 16),
-                       fg="#00ff88", bg="#0d0d1a")
+        dot = tk.Label(root, text="◉", font=("Segoe UI", 16), fg="#00ff88", bg="#0d0d1a")
         dot.pack(side="left", padx=(10, 6), pady=6)
 
-        # Title
-        tk.Label(root, text="ProVoiceAgent", font=("Segoe UI", 9, "bold"),
-                 fg="#5566ff", bg="#0d0d1a").place(x=40, y=4)
+        tk.Label(root, text="ProVoiceAgent™", font=("Segoe UI", 9, "bold"), fg="#5566ff", bg="#0d0d1a").place(x=40, y=4)
 
-        # Status label
-        lbl = tk.Label(root, text="Initializing…",
-                       font=("Segoe UI", 10), fg="white",
-                       bg="#0d0d1a", anchor="w")
-        lbl.place(x=40, y=24, width=320)
+        lbl = tk.Label(root, text="Initializing…", font=("Segoe UI", 10), fg="white", bg="#0d0d1a", anchor="w")
+        lbl.place(x=40, y=24, width=360)
 
         self._running = True
 
@@ -1867,8 +1957,8 @@ class StatusHUD:
 # MAIN ORCHESTRATOR
 # ══════════════════════════════════════════════════════════
 class ProVoiceAgent:
+    """Enterprise-grade voice automation agent"""
 
-    # Agent states
     STATES = {
         "STOPPED": 0,
         "IDLE": 1,
@@ -1876,71 +1966,40 @@ class ProVoiceAgent:
         "EXECUTING": 3,
     }
 
-    EXIT_PHRASES = {
-        "goodbye lucifer",
-        "stop lucifer",
-        "lucifer stop",
-        "lucifer goodbye",
-        "lucifer quit",
-        "quit lucifer",
-        "lucifer exit",
-        "exit lucifer",
-    }
-
-    START_PHRASES = {
-        "start lucifer",
-        "lucifer start",
-        "activate lucifer",
-        "lucifer activate",
-        "launch lucifer",
-        "lucifer launch",
-    }
-
-    ACTIVATION_PHRASES = {
-        "hello lucifer",
-        "lucifer",
-        "activate agent",
-        "agent activate",
-        "wake up lucifer",
-        "lucifer wake up",
-    }
+    EXIT_PHRASES = {"goodbye", "stop", "quit", "exit", "logout", "shutdown", "off"}
+    ACTIVATION_PHRASES = {"hello", "activate", "wake", "start", "ready", "listen"}
 
     def __init__(self):
-        log.info("╔══════════════════════════════════════════╗")
-        log.info("║     ProVoiceAgent - LUCIFER MODE        ║")
-        log.info("╚══════════════════════════════════════════╝")
+        log.info("╔════════════════════════════════════════════╗")
+        log.info("║   ProVoiceAgent™ ENTERPRISE EDITION       ║")
+        log.info("║   Advanced Desktop Automation AI           ║")
+        log.info("╚════════════════════════════════════════════╝")
 
-        self.tts      = TTSEngine()
-        self.voice    = VoiceEngine(self.tts)
-        self.brain    = AgentBrain()
-        self.executor = ActionExecutor(self.tts)
-        self.hud      = StatusHUD()
+        self.system_intel = SystemIntelligence()
+        self.tts = TTSEngine()
+        self.voice = VoiceEngine(self.tts)
+        self.brain = AgentBrain()
+        self.executor = ActionExecutor(self.tts, self.system_intel)
+        self.hud = StatusHUD()
         
-        # State management
         self._state = self.STATES["STOPPED"]
         self._running = False
-        self._activated = False
         
-        log.info(f"Agent initialized in STOPPED state")
+        log.info(f"Agent initialized - State: STOPPED")
 
     def _get_state_name(self) -> str:
-        """Get human-readable state name."""
         for name, value in self.STATES.items():
             if value == self._state:
                 return name
         return "UNKNOWN"
 
     def start(self):
-        """Main entry point - wait for startup command."""
+        """Main agent entry point"""
         self.hud.start()
         self._state = self.STATES["IDLE"]
         
-        self.hud.show("🛑  STOPPED - Say 'Start Lucifer'", "ready")
-        log.info(f"Agent state: {self._get_state_name()}")
-
-        self.tts.speak_sync(
-            "Lucifer is offline. Say 'Start Lucifer' to activate."
-        )
+        self.hud.show("🛑  OFFLINE - Say 'Start Lucifer'", "ready")
+        self.tts.speak_sync("Lucifer is offline. Say 'Start Lucifer' to activate.")
 
         self._running = True
         log.info("Waiting for startup command...")
@@ -1952,7 +2011,7 @@ class ProVoiceAgent:
                 elif self._state == self.STATES["ACTIVE"]:
                     self._wait_for_activation()
                 elif self._state == self.STATES["EXECUTING"]:
-                    self._execute_single_command()
+                    self._execute_command()
                 else:
                     time.sleep(0.5)
             except KeyboardInterrupt:
@@ -1963,179 +2022,128 @@ class ProVoiceAgent:
                 time.sleep(1)
 
     def _wait_for_startup(self):
-        """Wait for 'Start Lucifer' command to boot the agent."""
-        self.hud.show("🛑  STOPPED - Say 'Start Lucifer'", "ready")
-        log.info(f"State: {self._get_state_name()} - Waiting for startup...")
-
-        text = self.voice.listen(
-            timeout=AGENT_CONFIG.get("listen_timeout", 30),
-            phrase_limit=AGENT_CONFIG.get("phrase_limit", 10),
-        )
-
+        """Wait for startup command"""
+        self.hud.show("🛑  OFFLINE - Say 'Start Lucifer'", "ready")
+        
+        text = self.voice.listen(timeout=30, phrase_limit=10)
         if not text:
             return
 
         text_lower = text.lower()
-        
-        # Check for startup command
-        if text_lower in self.START_PHRASES or "start" in text_lower.lower():
+        if "start" in text_lower:
             self._boot_agent()
-            return
-
-        # Check for exit command
-        if text_lower in self.EXIT_PHRASES or "stop" in text_lower:
-            log.info("Received stop command in STOPPED state")
+        elif any(phrase in text_lower for phrase in self.EXIT_PHRASES):
             self._shutdown()
-            return
-
-        log.info(f"Ignored (not startup): \"{text}\"")
 
     def _boot_agent(self):
-        """Boot the agent - transition from IDLE to ACTIVE."""
+        """Boot the agent"""
         self._state = self.STATES["ACTIVE"]
         self.hud.show("⚡  ONLINE - Lucifer ready!", "processing")
         self.tts.speak("Lucifer is now online. Say 'Hello Lucifer' for commands.")
-        log.info(f"Agent BOOTED → State: {self._get_state_name()}")
+        log.info("Agent BOOTED")
         time.sleep(0.8)
 
     def _wait_for_activation(self):
-        """Active state: Wait for 'Hello Lucifer' to execute commands."""
+        """Wait for command activation"""
         self.hud.show("👀  ONLINE (say 'Hello Lucifer')", "ready")
-
-        text = self.voice.listen(
-            timeout=AGENT_CONFIG.get("listen_timeout", 30),
-            phrase_limit=AGENT_CONFIG.get("phrase_limit", 10),
-        )
-
+        
+        text = self.voice.listen(timeout=30, phrase_limit=10)
         if not text:
             return
 
         text_lower = text.lower()
-        
-        # Check for exit command
-        if text_lower in self.EXIT_PHRASES or "stop" in text_lower:
+        if any(phrase in text_lower for phrase in self.EXIT_PHRASES):
             self._shutdown()
-            return
-
-        # Check for activation (command execution)
-        if text_lower in self.ACTIVATION_PHRASES or "hello" in text_lower or "activate" in text_lower:
+        elif any(phrase in text_lower for phrase in self.ACTIVATION_PHRASES):
             self._activate_for_command()
-            return
-
-        log.info(f"Ignored (not activation): \"{text}\"")
-        self.hud.show("👀  ONLINE (not recognized)", "ready")
 
     def _activate_for_command(self):
-        """Activate for ONE command execution."""
+        """Activate for command execution"""
         self._state = self.STATES["EXECUTING"]
         self.hud.show("🎤  LISTENING for command", "processing")
         self.tts.speak("Ready. What do you need?")
-        log.info(f"Agent ACTIVATED → State: {self._get_state_name()}")
 
-    def _execute_single_command(self):
-        """Listen for ONE command and execute it."""
+    def _execute_command(self):
+        """Execute voice command"""
         self.hud.show("🎤  LISTENING for command…", "listening")
-
-        text = self.voice.listen(
-            timeout=AGENT_CONFIG.get("listen_timeout", 15),
-            phrase_limit=AGENT_CONFIG.get("phrase_limit", 20),
-        )
-
+        
+        text = self.voice.listen(timeout=15, phrase_limit=20)
         if not text:
-            self._return_to_active("No command detected")
+            self._return_to_active("No command")
             return
 
-        # Exit check
-        if text.lower() in self.EXIT_PHRASES or "stop" in text.lower():
+        text_lower = text.lower()
+        if any(phrase in text_lower for phrase in self.EXIT_PHRASES):
             self._shutdown()
             return
 
         log.info(f"📝  Command: \"{text}\"")
-        self.hud.show(f"🧠  {text[:42]}…", "processing")
+        self.hud.show(f"🧠  Processing…", "processing")
 
-        # Parse intent
-        action = self.brain.parse(text)
+        # Get system context
+        sys_info = self.system_intel.get_complete_system_info()
+        sys_context = {
+            "cpu": f"{sys_info.get('cpu', {}).get('percent_per_core', [0])[0]:.0f}",
+            "ram": f"{sys_info.get('memory', {}).get('percent', 0):.0f}",
+            "apps": ", ".join(list(sys_info.get('top_processes', {}).keys())[:3])
+        }
 
-        # Handle both single action (dict) and multiple actions (list)
-        actions = action if isinstance(action, list) else [action]
+        # Parse with context
+        action = self.brain.parse(text, sys_context)
         
-        # Execute all actions in sequence
+        # Execute action(s)
+        actions = action if isinstance(action, list) else [action]
         final_result = None
+
         for idx, act in enumerate(actions, 1):
             if not isinstance(act, dict):
                 continue
-                
-            act_name = act.get("action", "?")
-            
-            # Show current action being executed
-            if len(actions) > 1:
-                self.hud.show(f"⚡  [{idx}/{len(actions)}] {act_name}: {self._action_summary(act)}", "executing")
-            else:
-                self.hud.show(f"⚡  {act_name}: {self._action_summary(act)}", "executing")
 
-            # Execute the action
+            act_name = act.get("action", "?")
+            if len(actions) > 1:
+                self.hud.show(f"⚡  [{idx}/{len(actions)}] {act_name}", "executing")
+            else:
+                self.hud.show(f"⚡  {act_name}", "executing")
+
             result = self.executor.execute(act, text)
-            final_result = result  # Keep track of last result
-            
-            # Small delay between multi-step actions
+            final_result = result
+
             if len(actions) > 1 and idx < len(actions):
                 time.sleep(0.5)
 
-        # Handle TTS feedback from final result
+        # Handle result
         if final_result:
             speech = final_result.speak or (final_result.message if not final_result.success else None)
             if speech:
-                self.hud.show(f"🔊  {speech[:42]}", "speaking")
+                self.hud.show(f"🔊  Speaking…", "speaking")
                 self.tts.speak(speech)
 
-            # Update HUD with final result
-            icon   = "✅" if final_result.success else "❌"
-            state  = "success" if final_result.success else "error"
+            icon = "✅" if final_result.success else "❌"
+            state = "success" if final_result.success else "error"
             self.hud.show(f"{icon}  {final_result.message[:48]}", state)
-        
+
         time.sleep(0.8)
-        
-        # Return to active after command execution
-        self._return_to_active("Command executed")
+        self._return_to_active("Command done")
 
     def _return_to_active(self, reason: str = ""):
-        """Return from EXECUTING to ACTIVE state."""
+        """Return to active state"""
         self._state = self.STATES["ACTIVE"]
-        msg = f"Returned to active. ({reason})" if reason else "Returned to active."
-        log.info(f"Agent returned to ACTIVE: {reason}")
+        log.info(f"Returned to ACTIVE ({reason})")
         self.hud.show("👀  ONLINE (say 'Hello Lucifer')", "ready")
         time.sleep(0.5)
 
     def _shutdown(self):
-        """Graceful shutdown - transition back to IDLE (waiting for restart)."""
+        """Shutdown agent"""
         self._state = self.STATES["IDLE"]
-        log.info(f"Agent SHUTDOWN → State: {self._get_state_name()}")
-        self.hud.show("🛑  OFFLINE - Say 'Start Lucifer' to restart", "ready")
-        self.tts.speak_sync("Lucifer going offline. Say 'Start Lucifer' to restart.")
+        log.info("Agent SHUTDOWN")
+        self.hud.show("🛑  OFFLINE - Say 'Start Lucifer'", "ready")
+        self.tts.speak_sync("Lucifer going offline.")
         time.sleep(0.5)
-
-    def _action_summary(self, action: dict) -> str:
-        a = action.get("action", "")
-        if a == "open_app":
-            return action.get("app", "") + (" → " + action.get("url", "") if action.get("url") else "")
-        if a == "search_web":
-            return action.get("query", "")[:30]
-        if a == "open_url":
-            return action.get("url", "")[:30]
-        if a in ("type_text", "paste_text", "write_notepad"):
-            return action.get("text", "")[:30]
-        if a == "system_command":
-            return action.get("command", "")
-        if a == "calculate":
-            return action.get("expression", "")
-        return ""
 
 
 # ══════════════════════════════════════════════════════════
 # ENTRY POINT
 # ══════════════════════════════════════════════════════════
-
-# For main.py entry point
 def listen_and_paste():
     agent = ProVoiceAgent()
     agent.start()
